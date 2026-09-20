@@ -32,12 +32,12 @@ interface PreservationDeps {
   store: PreservationStore;
   provider: SandboxProvider;
   sandbox: SandboxPreservationStorage;
-  session: SessionCoreRepository;
-  messages: MessageRepository;
-  failures: MessageFailureService;
-  messenger: SessionMessenger;
-  sockets: SessionWebSocketManager;
-  alarm: AlarmScheduler;
+  session: Pick<SessionCoreRepository, "getSession" | "transaction">;
+  messages: Pick<MessageRepository, "getProcessingMessage">;
+  failures: Pick<MessageFailureService, "record" | "deliver">;
+  messenger: Pick<SessionMessenger, "broadcast">;
+  sockets: Pick<SessionWebSocketManager, "getSandboxSocket" | "send">;
+  alarm: Pick<AlarmScheduler, "schedule">;
   background: BackgroundTasks;
   processQueue(): Promise<void>;
   reconcileStatus(): Promise<void>;
