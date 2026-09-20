@@ -123,13 +123,16 @@ export function useSessionSocket(
   const subscriptionWaitersRef = useRef(new Set<(subscribed: boolean) => void>());
   const pendingPromptRequestIdRef = useRef<string | null>(null);
   const pendingRequestsRef = useRef(new Map<string, PendingCorrelatedRequest>());
+  const preservationHeld =
+    !!state.sessionState?.sandboxPreservation &&
+    state.sessionState.sandboxPreservation.phase !== "running";
   const {
     sandboxAccess,
     clear: clearSandboxAccess,
     refresh: refreshSandboxAccess,
   } = useSandboxAccess(
     sessionId,
-    state.sessionState?.sandboxStatus === "ready",
+    state.sessionState?.sandboxStatus === "ready" && !preservationHeld,
     capabilities.sandboxAccess
   );
 
@@ -202,7 +205,14 @@ export function useSessionSocket(
       if (message.type === "subscribed") {
         console.log("WebSocket subscribed to session");
         pendingTextRef.current = null;
-        void refreshSandboxAccess();
+        if (
+          message.session.sandboxPreservation &&
+          message.session.sandboxPreservation.phase !== "running"
+        ) {
+          void clearSandboxAccess();
+        } else {
+          void refreshSandboxAccess();
+        }
       } else if (message.type === "sandbox_access_changed") {
         void refreshSandboxAccess();
       } else if (message.type === "sandbox_error") {
@@ -221,6 +231,7 @@ export function useSessionSocket(
       }
 
       const clearsSandboxAccess =
+        (message.type === "sandbox_preservation" && message.preservation.phase !== "running") ||
         message.type === "sandbox_spawning" ||
         message.type === "sandbox_error" ||
         (message.type === "sandbox_status" &&
@@ -423,7 +434,21 @@ export function useSessionSocket(
   const sessionState = state.sessionState
     ? {
         ...state.sessionState,
-        ...(sandboxAccess ?? {}),
+        ...(sandboxAccess ?? {
+          codeServerUrl: null,
+          codeServerPassword: null,
+          vncUrl: null,
+          vncPassword: null,
+          ttydUrl: null,
+          ttydToken: null,
+          tunnelUrls: null,
+          // Keep existing diagnostic links outside preservation holds. They do
+          // not contain sandbox credentials and remain useful after failures.
+          sandboxDashboardUrl:
+            !preservationHeld && capabilities.sandboxAccess
+              ? state.sessionState.sandboxDashboardUrl
+              : null,
+        }),
       }
     : null;
 

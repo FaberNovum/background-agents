@@ -583,6 +583,7 @@ describe("SandboxPreservation", () => {
       captureByMs: 460_000,
       retireByMs: 1_270_000,
     });
+    expect(f.deps.messenger.broadcast).toHaveBeenCalledWith({ type: "sandbox_access_changed" });
     expect(f.deps.sockets.send).toHaveBeenLastCalledWith(
       expect.anything(),
       expect.objectContaining({

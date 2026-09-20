@@ -542,6 +542,9 @@ export class SandboxPreservation {
     });
     this.publish(next);
     if (failure) this.deps.failures.deliver(failure);
+    // Withdraw application access when final ownership is acquired. This does
+    // not revoke provider-issued capabilities or stop external writers.
+    this.deps.messenger.broadcast({ type: "sandbox_access_changed" });
     this.deps.messenger.broadcast({ type: "processing_status", isProcessing: false });
     this.deps.background.submit(() => this.deps.reconcileStatus(), {
       name: "sandbox.preservation_status",
