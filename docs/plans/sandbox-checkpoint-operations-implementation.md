@@ -7,8 +7,9 @@ control-plane, and web recovery UI). It reuses `SandboxPreservation` and its val
 `sandbox_preservation` record. There is no second coordinator, operation journal, SQL table, or
 independently writable admission flag.
 
-The local integration base includes C1's reviewed ports and the preservation runtime fixes through
-`b1f9f012f`. These dependencies must land before deploying C2.
+The PR is stacked on preservation-web PR #1987 at `2f9d7151a`, including merged C1 (#1989) and the
+reviewed runtime/control-plane preservation dependencies (#1985 and #1986). Those preservation
+dependencies must land before deploying C2.
 
 ## Model
 
@@ -119,7 +120,7 @@ Full unit and Workerd suites, all control-plane typecheck configurations, Worker
 lint and actual ESLint boundary tests are required before handoff. Live-provider validation is
 separate from these deterministic checks.
 
-### Local validation results
+### Original implementation validation
 
 - Control-plane unit: **4,912 passed** across 307 files.
 - Full Workerd integration: **1,311 passed, one skipped** across 110 files. Additional focused
@@ -137,3 +138,19 @@ separate from these deterministic checks.
 The simplicity pass kept the outcome type in the existing lifecycle ports and removed the old
 checkpoint boolean/generation pair and prior-status restoration. No generic operation framework or
 additional coordinator was introduced.
+
+### PR preparation validation
+
+After replaying C2 on the latest preservation stack, the only conflict was its storage-port name. C2
+now narrows the existing `SandboxPreservationStorage` port instead of adding a duplicate checkpoint
+port; lifecycle status writes remain behind the manager-owned completion callback.
+
+- Full control-plane unit suite: **4,916 passed** across 307 files.
+- Focused Workerd preservation, early-connect, snapshot/access, and collaborator-wiring suites: **20
+  passed** across four files.
+- Runtime preservation suites: **48 passed**.
+- All control-plane typecheck configurations, Worker/Node builds, lint, and both ESLint-boundary
+  tests passed. The full Workerd result above describes the original implementation baseline; this
+  revalidation uses the focused suites on the updated dependency stack.
+- Repository CI targets PRs into `main`; retarget and require its checks after the preservation
+  stack merges. Stacking does not waive runtime-image and live-provider rollout gates.
