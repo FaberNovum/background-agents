@@ -43,18 +43,35 @@ identity.
 
 ## Behavior matrix
 
-| Situation                                               | Ordinary work and access                                        | New capture / replacement                             |
-| ------------------------------------------------------- | --------------------------------------------------------------- | ----------------------------------------------------- |
-| Ready, no capture                                       | Normal policy                                                   | Allowed                                               |
-| Nondestructive checkpoint in flight                     | Normal policy; interactive access stays available               | Serialized behind the checkpoint                      |
-| Nondestructive checkpoint result unknown                | Normal policy while the source remains ready                    | Held; a timeout is not proof remote capture ended     |
-| Final preservation draining/prepared/capturing/retiring | Held, including access after async decryption and diff commands | Final owner only                                      |
-| Final preservation failed/unknown                       | Held                                                            | Explicit supported recovery only                      |
-| Verified saved final receipt                            | Existing restore admission policy                               | Restore without silently substituting a fresh sandbox |
+| Situation                                                       | Ordinary work and access                                                 | New capture / replacement                             |
+| --------------------------------------------------------------- | ------------------------------------------------------------------------ | ----------------------------------------------------- |
+| Ready, no capture                                               | Normal policy                                                            | Allowed                                               |
+| Nondestructive checkpoint in flight                             | Normal policy; interactive access stays available                        | Serialized behind the checkpoint                      |
+| Nondestructive checkpoint result unknown                        | Normal policy while the source remains ready                             | Held; a timeout is not proof remote capture ended     |
+| Final preservation waiting/draining/prepared/capturing/retiring | Application admission held, including credential reads and diff commands | Final owner only                                      |
+| Final preservation failed/unknown                               | Held                                                                     | Explicit supported recovery only                      |
+| Verified saved final receipt                                    | Existing restore admission policy                                        | Restore without silently substituting a fresh sandbox |
 
 Normal prompt, push, and diff commands resolve the same admission-aware socket target. Lifecycle
 preparation, stop confirmation, heartbeat, and runtime facts retain their separate raw socket path.
 Access checks admission both before and after secret decryption.
+
+### Access boundary
+
+Final ownership withdraws access from the application: it emits an access-change notification,
+denies new credential reads, disables the web access hook, and clears/masks cached credentials,
+terminal URLs, and tunnel links. Late credential responses cannot repopulate a held view.
+
+This is **not an all-writer freeze**. Previously issued provider credentials, independently opened
+connections, detached processes, and arbitrary repository servers are not revoked or stopped by the
+application admission gate. Runtime preparation confirms managed agent execution stopped, not that
+every possible filesystem writer stopped. Live-capture providers can therefore observe external
+writes during capture; writes after capture and before source retirement may be absent from the
+saved recovery point. Eventual source retirement does not retroactively include them.
+
+The accepted C2 scope preserves existing provider capture/stop behavior and documents this
+limitation. It does not introduce a new capture gate requiring universal execution containment.
+Provider/runtime-wide write fencing is a separate enhancement, not a C2 release requirement.
 
 Idle expiry can begin final preservation during an ordinary checkpoint. It closes new work
 immediately, waits for capture ownership, and requires a fresh matching preparation and final
@@ -62,9 +79,17 @@ capture. An unresolved checkpoint becomes a visible unknown hold instead of auth
 provider capture or source destruction. Unresponsive-execution recovery likewise closes admission
 before its message stop hold can be cleared.
 
+Waiting has its own durable `waiting_for_checkpoint` phase and deadline. The preparation stop budget
+starts only after prior capture ownership settles; all budgets remain bounded by the provider's hard
+expiry. Restart or an unresolved capture at the wait deadline produces an unknown hold, not
+permission to overlap provider operations.
+
 Heartbeat-stale recovery still permits a nondestructive capture of the existing source under the
 same operation owner. Destruction follows only a completed capture; skipped, failed, or unknown
-results enter the preservation hold.
+results enter the preservation hold. Preservation claims retirement synchronously for the exact
+completed heartbeat operation, generation, and provider object while the outer phase is still
+running. If a final request has already acquired ownership, heartbeat recovery does not destroy its
+source or detach its socket.
 
 ## Outcomes and provider semantics
 
@@ -154,3 +179,24 @@ port; lifecycle status writes remain behind the manager-owned completion callbac
   revalidation uses the focused suites on the updated dependency stack.
 - Repository CI targets PRs into `main`; retarget and require its checks after the preservation
   stack merges. Stacking does not waive runtime-image and live-provider rollout gates.
+
+### Review-feedback validation
+
+The feedback changes add a distinct checkpoint-wait budget, preservation-owned heartbeat retirement,
+UI credential withdrawal, typed/split tests, and retryable pre-provider failures. The access
+boundary above records the accepted scope without a new provider capture gate.
+
+- Full control-plane unit suite: **4,929 passed** across 308 files.
+- Full Workerd integration suite: **1,312 passed, one skipped** across 110 files.
+- Full web unit suite: **1,787 passed** across 206 files.
+- Full shared unit suite: **939 passed** across 57 files.
+- All control-plane typecheck configurations and web typecheck passed.
+- Worker/Node builds, control-plane lint, focused web lint, formatting of changed files, and both
+  actual ESLint sandbox-boundary tests passed.
+- New regressions cover checkpoint completion after the original stop window, restart/hard expiry,
+  persisted wait metadata, heartbeat/final ownership races, cached and late credential responses,
+  initial/reconnect access holds, and retry versus unknown classification around provider
+  invocation.
+
+No live-provider canary or deployment was performed. The earlier independent review predates these
+feedback changes; this validation does not claim a new independent approval.

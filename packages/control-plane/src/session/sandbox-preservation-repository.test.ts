@@ -57,6 +57,42 @@ describe("SandboxPreservationRepository", () => {
     f.db.close();
   });
 
+  it("round-trips the checkpoint wait deadline without starting a preparation budget", () => {
+    const f = repository();
+    const state = record({
+      provider: "modal",
+      phase: "waiting_for_checkpoint",
+      operationId: "final-1",
+      waitByMs: 9_000,
+      retireByMs: 19_000,
+      checkpoint,
+    });
+    f.repository.write(state);
+    expect(f.repository.read()).toEqual(state);
+    expect(f.repository.read()?.stopByMs).toBeUndefined();
+    f.db.close();
+  });
+
+  it.each(["operationId", "waitByMs", "retireByMs"] as const)(
+    "rejects persisted waiting state without %s",
+    (field) => {
+      const f = repository();
+      const state = record({
+        phase: "waiting_for_checkpoint",
+        operationId: "final-1",
+        waitByMs: 9_000,
+        retireByMs: 19_000,
+      });
+      delete state[field];
+      f.sql.exec(
+        "INSERT INTO sandbox_preservation (singleton, state) VALUES (1, ?)",
+        JSON.stringify(state)
+      );
+      expect(() => f.repository.read()).toThrow(SessionStorageIntegrityError);
+      f.db.close();
+    }
+  );
+
   it.each([
     { version: 2 },
     { operationId: "" },
