@@ -213,7 +213,7 @@ function createSandboxRow(modalSandboxId: string): SandboxRow {
 const TEST_CONFIG: WebSocketManagerConfig = { authTimeoutMs: 100 };
 
 /** Create a fresh manager with all dependencies. */
-function createManager() {
+function createManager(config: WebSocketManagerConfig = TEST_CONFIG) {
   const fakeHost = createFakeSocketHost();
   const mockRepo = createMockRepository();
   const alarmScheduler = {
@@ -229,7 +229,7 @@ function createManager() {
     mockRepo.repo as unknown as WsClientMappingRepository,
     alarmScheduler,
     log,
-    TEST_CONFIG
+    config
   );
 
   return {
@@ -677,6 +677,18 @@ describe("SessionWebSocketManagerImpl", () => {
   });
 
   describe("getSandboxCommandTarget", () => {
+    it("gates ordinary commands while preserving the raw lifecycle socket", () => {
+      let allowed = true;
+      const { manager, mockRepo } = createManager({ ...TEST_CONFIG, mayDispatch: () => allowed });
+      mockRepo.setSandbox(createSandboxRow("sb-1"));
+      const ws = createFakeWebSocket();
+      manager.acceptAndSetSandboxSocket(ws, "sb-1");
+      expect(manager.getSandboxCommandTarget()).toEqual({ kind: "dispatch", socket: ws });
+      allowed = false;
+      expect(manager.getSandboxCommandTarget()).toEqual({ kind: "unavailable" });
+      expect(manager.getSandboxSocket()).toBe(ws);
+      expect(ws.close).not.toHaveBeenCalled();
+    });
     it("reports unavailable for an attached socket without a sandbox row", () => {
       const { manager, mockRepo } = createManager();
       const ws = createFakeWebSocket();

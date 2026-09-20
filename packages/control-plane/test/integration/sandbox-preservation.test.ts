@@ -8,7 +8,7 @@ import {
   seedMessage,
   seedSandboxAuth,
 } from "./helpers";
-import { runInSessionDO } from "./session-do-access";
+import { componentsOf, runInSessionDO } from "./session-do-access";
 
 const AUTH_TOKEN = "preservation-integration-token";
 const SANDBOX_ID = "preservation-sandbox";
@@ -54,6 +54,115 @@ async function readPreservation(stub: DurableObjectStub): Promise<Record<string,
 }
 
 describe("sandbox preservation wiring", () => {
+  it.each(["lifetime", "stop_timeout"])(
+    "allows checkpoint-time access and commands, but blocks both after %s preservation",
+    async (trigger) => {
+      const name = `checkpoint-admission-${Date.now()}`;
+      const { stub } = await initNamedSession(name);
+      await seedSandboxAuth(stub, { authToken: AUTH_TOKEN, sandboxId: SANDBOX_ID });
+      const generation = await seedPreservation(stub, {
+        provider: "modal",
+        providerObjectId: "checkpoint-source",
+        generationReady: true,
+        runtimeReady: true,
+        protocolVersion: 1,
+      });
+      const now = Date.now();
+      await runInSessionDO(stub, (_instance, state) => {
+        state.storage.sql.exec(
+          "UPDATE sandbox SET modal_object_id = ?, last_heartbeat = ?, last_activity = ?",
+          "checkpoint-source",
+          now,
+          now
+        );
+        const row = state.storage.sql
+          .exec<{ state: string }>("SELECT state FROM sandbox_preservation")
+          .one();
+        const record = JSON.parse(row.state);
+        record.checkpoint = {
+          version: 1,
+          operationId: "checkpoint-op",
+          generation,
+          provider: "modal",
+          providerObjectId: "checkpoint-source",
+          runtimeVersion: "v71-test",
+          reason: "execution_complete",
+          startedAtMs: now,
+          deadlineAtMs: now + 300_000,
+          nonDestructive: true,
+          phase: "capturing",
+        };
+        state.storage.sql.exec("UPDATE sandbox_preservation SET state = ?", JSON.stringify(record));
+      });
+      const { ws } = await openSandboxWs(name, { authToken: AUTH_TOKEN, sandboxId: SANDBOX_ID });
+      expect(ws).not.toBeNull();
+      ws!.accept();
+      expect((await stub.fetch("http://internal/internal/sandbox-access")).status).toBe(200);
+      expect(
+        await runInSessionDO(
+          stub,
+          (instance) => componentsOf(instance).wsManager.getSandboxCommandTarget().kind
+        )
+      ).toBe("dispatch");
+
+      // Real alarm wiring recognizes the lost local capture promise after restart.
+      await runInSessionDO(stub, (instance) => instance.alarm());
+      expect(await readPreservation(stub)).toMatchObject({
+        phase: "running",
+        checkpoint: { phase: "unknown" },
+      });
+      expect((await stub.fetch("http://internal/internal/sandbox-access")).status).toBe(200);
+      if (trigger === "stop_timeout") {
+        await runInSessionDO(stub, (instance) =>
+          componentsOf(instance).lifecycleManager.terminateUnresponsiveSandbox(
+            "stop_confirmation_timeout"
+          )
+        );
+      } else {
+        await runInSessionDO(stub, (_instance, state) => {
+          const row = state.storage.sql
+            .exec<{ state: string }>("SELECT state FROM sandbox_preservation")
+            .one();
+          state.storage.sql.exec(
+            "UPDATE sandbox_preservation SET state = ?",
+            JSON.stringify({ ...JSON.parse(row.state), drainAtMs: Date.now() - 1 })
+          );
+        });
+        await runInSessionDO(stub, (instance) => instance.alarm());
+      }
+      expect(await readPreservation(stub)).toMatchObject({
+        phase: "unknown",
+        checkpoint: { phase: "unknown" },
+      });
+      expect((await stub.fetch("http://internal/internal/sandbox-access")).status).toBe(409);
+      expect(
+        await runInSessionDO(
+          stub,
+          (instance) => componentsOf(instance).wsManager.getSandboxCommandTarget().kind
+        )
+      ).toBe("unavailable");
+      expect(await queryDO(stub, "SELECT status FROM sandbox")).toEqual([{ status: "ready" }]);
+      ws!.close();
+    }
+  );
+
+  it("holds a persisted legacy snapshotting row instead of inferring readiness", async () => {
+    const name = `checkpoint-legacy-${Date.now()}`;
+    const { stub } = await initNamedSession(name);
+    await seedSandboxAuth(stub, {
+      authToken: AUTH_TOKEN,
+      sandboxId: SANDBOX_ID,
+      status: "snapshotting",
+    });
+    await runInSessionDO(stub, (instance) => instance.alarm());
+    expect(await readPreservation(stub)).toMatchObject({
+      phase: "unknown",
+      reason: "legacy_checkpoint",
+    });
+    expect((await stub.fetch("http://internal/internal/sandbox-access")).status).toBe(409);
+    expect(await queryDO(stub, "SELECT status FROM sandbox")).toEqual([{ status: "snapshotting" }]);
+  });
+
   it("holds queued work until a versioned runtime acknowledges its sandbox generation", async () => {
     const name = `preservation-generation-${Date.now()}`;
     const { stub } = await initNamedSession(name);

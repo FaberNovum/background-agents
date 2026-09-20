@@ -73,6 +73,41 @@ vi.mock("../../auth/crypto", async (importOriginal) => {
 
 // ==================== Mock Factories ====================
 
+function wireCheckpointOwner(
+  manager: SandboxLifecycleManager,
+  provider: SandboxProvider,
+  storage: ReturnType<typeof createMockStorage>,
+  broadcaster: SandboxBroadcaster
+) {
+  const row = storage.getSandbox()!;
+  let state: PreservationRecord = {
+    phase: "running",
+    generation: { sandboxId: row.modal_sandbox_id!, createdAt: row.created_at },
+    provider: provider.name,
+    providerObjectId: row.modal_object_id,
+    lifetimeKind: "none",
+    expiresAtMs: null,
+    drainAtMs: null,
+    generationReady: true,
+  };
+  const preservation = new SandboxPreservation({
+    store: {
+      read: () => structuredClone(state),
+      write: (next: PreservationRecord) => {
+        state = structuredClone(next);
+      },
+    },
+    provider,
+    sandbox: storage,
+    session: { getSession: () => storage.getSession(), transaction: (fn: () => unknown) => fn() },
+    messenger: broadcaster,
+    alarm: createMockAlarmScheduler(),
+    background: { submit: vi.fn() },
+  } as never);
+  manager.setPreservation(preservation);
+  return preservation;
+}
+
 function createMockSession(overrides: Partial<SessionRow> = {}): SessionRow {
   return {
     id: "session-123",
@@ -407,6 +442,7 @@ function createMockProvider(
     capabilities: {
       supportsSandboxTimeout: true,
       supportsSnapshots: true,
+      snapshotStopsSandbox: false,
       supportsRestore: true,
       ...overrides.capabilities,
     },
@@ -590,8 +626,11 @@ describe("final preservation lifecycle integration", () => {
       started: vi.fn(async () => {}),
       isHolding: vi.fn(() => false),
       request: vi.fn(async () => true),
-      beginCheckpoint: vi.fn(() => true),
-      endCheckpoint: vi.fn(),
+      mayAcquire: vi.fn(() => true),
+      checkpoint: vi.fn<SandboxPreservationLifecycle["checkpoint"]>(async () => ({
+        kind: "skipped",
+        reason: "test",
+      })),
       recoveryReceipt: vi.fn<SandboxPreservationLifecycle["recoveryReceipt"]>(() => undefined),
       restoreFailed: vi.fn(),
     };
@@ -632,7 +671,8 @@ describe("final preservation lifecycle integration", () => {
       sockets: { getSandboxSocket: () => null },
       alarm: createMockAlarmScheduler(),
       background: { submit: vi.fn() },
-      retireAccess: vi.fn(),
+      completePreservation: (generation: SandboxGeneration, objectId: string | null) =>
+        f.manager.completePreservation(generation, objectId),
     } as never);
     f.manager.setPreservation(preservation);
     return { preservation, read: () => state };
@@ -726,6 +766,7 @@ describe("final preservation lifecycle integration", () => {
       createMockSandbox()
     );
     f.preservation.isHolding.mockReturnValue(true);
+    f.preservation.mayAcquire.mockReturnValue(false);
     await f.manager.terminateUnresponsiveSandbox("stop_confirmation_timeout");
     expect(await f.manager.terminateFailedSandbox("runtime failed")).toBe(false);
     expect(await f.manager.handleAlarm()).toBe("no_action");
@@ -737,7 +778,7 @@ describe("final preservation lifecycle integration", () => {
   it("routes destructive ordinary snapshots through confirmed preservation", async () => {
     const f = fixture(createMockProvider({ capabilities: { snapshotStopsSandbox: true } }));
     await f.manager.triggerSnapshot("execution_complete");
-    expect(f.preservation.request).toHaveBeenCalledWith("execution_complete");
+    expect(f.preservation.checkpoint).toHaveBeenCalledWith("execution_complete");
     expect(f.provider.takeSnapshot).not.toHaveBeenCalled();
   });
 
@@ -751,8 +792,7 @@ describe("final preservation lifecycle integration", () => {
 
     await f.manager.triggerSnapshot("execution_complete");
 
-    expect(f.preservation.request).toHaveBeenCalledWith("execution_complete");
-    expect(f.preservation.beginCheckpoint).not.toHaveBeenCalled();
+    expect(f.preservation.checkpoint).toHaveBeenCalledWith("execution_complete");
     expect(f.provider.takeSnapshot).not.toHaveBeenCalled();
     expect(sandbox.status).toBe("ready");
   });
@@ -2033,6 +2073,8 @@ describe("SandboxLifecycleManager", () => {
       expect(sandbox.runtime_version).toBe(COMPATIBLE_RUNTIME_VERSION);
 
       await manager.spawnSandbox();
+      sandbox.status = "ready";
+      wireCheckpointOwner(manager, provider, storage, createMockBroadcaster());
       await manager.triggerSnapshot("execution_complete");
 
       expect(sandbox.runtime_version).toBeNull();
@@ -2635,8 +2677,9 @@ describe("SandboxLifecycleManager", () => {
     it("still snapshots a ready sandbox that goes heartbeat-stale", async () => {
       const now = Date.now();
       const sandbox = createMockSandbox({ status: "ready", last_heartbeat: now - 100_000 });
-      const { manager, provider } = build(sandbox, { hasSocket: false });
+      const { manager, provider, storage, broadcaster } = build(sandbox, { hasSocket: false });
 
+      wireCheckpointOwner(manager, provider, storage, broadcaster);
       await manager.handleAlarm();
 
       expect(provider.takeSnapshot).toHaveBeenCalled();
@@ -2874,6 +2917,7 @@ describe("SandboxLifecycleManager", () => {
         createTestConfig()
       );
 
+      wireCheckpointOwner(manager, provider, storage, broadcaster);
       await manager.triggerSnapshot("test_reason");
 
       expect(provider.takeSnapshot).toHaveBeenCalled();
@@ -2883,10 +2927,11 @@ describe("SandboxLifecycleManager", () => {
       expect(
         broadcaster.messages.some((m) => (m as { type: string }).type === "snapshot_saved")
       ).toBe(true);
-      expect(broadcaster.messages.slice(-2)).toEqual([
-        { type: "sandbox_status", status: "ready" },
-        { type: "sandbox_access_changed" },
-      ]);
+      expect(sandbox.status).toBe("ready");
+      expect(broadcaster.messages).not.toContainEqual({
+        type: "sandbox_status",
+        status: "snapshotting",
+      });
     });
 
     it("skips when provider does not support snapshots", async () => {
@@ -2915,6 +2960,7 @@ describe("SandboxLifecycleManager", () => {
         createTestConfig()
       );
 
+      wireCheckpointOwner(manager, provider, storage, broadcaster);
       await manager.triggerSnapshot("test_reason");
 
       // Should not crash, just skip
@@ -2943,6 +2989,7 @@ describe("SandboxLifecycleManager", () => {
         createTestConfig()
       );
 
+      wireCheckpointOwner(manager, provider, storage, broadcaster);
       await manager.triggerSnapshot("execution_complete");
 
       expect(storage.calls).toContain(
@@ -2974,10 +3021,11 @@ describe("SandboxLifecycleManager", () => {
         createTestConfig()
       );
 
+      wireCheckpointOwner(manager, provider, storage, broadcaster);
       await manager.triggerSnapshot("execution_complete");
 
       expect(sandbox.status).toBe("stale");
-      expect(storage.calls).toContain("transitionSandboxStatus:snapshotting->ready");
+      expect(storage.calls).not.toContain("transitionSandboxStatus:snapshotting->ready");
       expect(broadcaster.messages).not.toContainEqual({ type: "sandbox_status", status: "ready" });
       expect(broadcaster.messages).not.toContainEqual({ type: "sandbox_access_changed" });
       // The image itself is still recorded: it describes the filesystem, not the row.
@@ -3008,6 +3056,7 @@ describe("SandboxLifecycleManager", () => {
         createTestConfig()
       );
 
+      wireCheckpointOwner(manager, provider, storage, broadcaster);
       await manager.triggerSnapshot("execution_complete");
 
       expect(sandbox.snapshot_image_id).toBeNull();
@@ -3040,6 +3089,7 @@ describe("SandboxLifecycleManager", () => {
       );
 
       // Should not throw
+      wireCheckpointOwner(manager, provider, storage, broadcaster);
       await manager.triggerSnapshot("test");
 
       expect(storage.calls).not.toContain("recordSandboxSnapshot");
@@ -3233,7 +3283,7 @@ describe("SandboxLifecycleManager", () => {
       expect(alarmScheduler.alarms.length).toBe(1);
     });
 
-    it("triggers snapshot before stopping", async () => {
+    it("does not perform an unowned legacy capture before stopping", async () => {
       const now = Date.now();
       const sandbox = createMockSandbox({
         status: "ready",
@@ -3258,10 +3308,10 @@ describe("SandboxLifecycleManager", () => {
 
       await manager.handleAlarm();
 
-      expect(provider.takeSnapshot).toHaveBeenCalled();
+      expect(provider.takeSnapshot).not.toHaveBeenCalled();
     });
 
-    it("snapshots and explicitly stops non-resumable providers on inactivity timeout", async () => {
+    it("retains legacy cleanup without an unowned snapshot when no coordinator is installed", async () => {
       const now = Date.now();
       const sandbox = createMockSandbox({
         status: "ready",
@@ -3289,12 +3339,7 @@ describe("SandboxLifecycleManager", () => {
 
       await manager.handleAlarm();
 
-      expect(provider.takeSnapshot).toHaveBeenCalledWith(
-        expect.objectContaining({
-          providerObjectId: "modal-obj-123",
-          reason: "inactivity_timeout",
-        })
-      );
+      expect(provider.takeSnapshot).not.toHaveBeenCalled();
       expect(stopSandbox).toHaveBeenCalledWith(
         expect.objectContaining({
           providerObjectId: "modal-obj-123",
@@ -3335,12 +3380,7 @@ describe("SandboxLifecycleManager", () => {
 
       await manager.handleAlarm();
 
-      expect(provider.takeSnapshot).toHaveBeenCalledWith(
-        expect.objectContaining({
-          providerObjectId: "modal-obj-123",
-          reason: "inactivity_timeout",
-        })
-      );
+      expect(provider.takeSnapshot).not.toHaveBeenCalled();
       expect(stopSandbox).not.toHaveBeenCalled();
       expect(wsManager.sendToSandbox).toHaveBeenCalledWith({ type: "shutdown" });
     });
@@ -5547,8 +5587,11 @@ describe("status writes after a provider await (COL-99)", () => {
         started: vi.fn(async () => {}),
         isHolding: vi.fn(() => false),
         request: vi.fn(async () => true),
-        beginCheckpoint: vi.fn(() => true),
-        endCheckpoint: vi.fn(),
+        mayAcquire: vi.fn(() => true),
+        checkpoint: vi.fn<SandboxPreservationLifecycle["checkpoint"]>(async () => ({
+          kind: "skipped",
+          reason: "test",
+        })),
         recoveryReceipt: vi.fn(() => undefined),
         restoreFailed: vi.fn(),
       } satisfies SandboxPreservationLifecycle;
@@ -5786,6 +5829,7 @@ describe("status writes after a provider await (COL-99)", () => {
       createTestConfig()
     );
 
+    wireCheckpointOwner(manager, provider, storage, broadcaster);
     await manager.triggerSnapshot("execution_complete");
 
     expect(sandbox.status).toBe("snapshotting");

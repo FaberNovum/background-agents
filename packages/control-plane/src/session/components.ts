@@ -287,7 +287,7 @@ export function createSessionRuntime(platform: SessionPlatform, env: Env): Sessi
     wsClientMappingRepository,
     alarmScheduler,
     log,
-    { authTimeoutMs: WS_AUTH_TIMEOUT_MS }
+    { authTimeoutMs: WS_AUTH_TIMEOUT_MS, mayDispatch: () => preservation.mayDispatch() }
   );
   // Platform-level ping/pong: keepalives are answered without waking the
   // runtime. Session-wide wiring, so it lives here.
@@ -460,7 +460,8 @@ export function createSessionRuntime(platform: SessionPlatform, env: Env): Sessi
     background: backgroundTasks,
     processQueue: () => messageQueue.processMessageQueue(),
     reconcileStatus: () => statusService.reconcileAfterExecution(false),
-    retireAccess: () => lifecycleManager.retirePreservedAccess(),
+    completePreservation: (generation, objectId) =>
+      lifecycleManager.completePreservation(generation, objectId),
   });
   lifecycleManager.setPreservation(preservation);
   const executionStop: ExecutionStopCoordinator = new ExecutionStopCoordinator(
@@ -553,7 +554,9 @@ export function createSessionRuntime(platform: SessionPlatform, env: Env): Sessi
     messenger,
     recordTerminalMessage,
     statusService,
-    (reason) => lifecycleManager.triggerSnapshot(reason),
+    async (reason) => {
+      await lifecycleManager.triggerSnapshot(reason);
+    },
     updateLastActivity,
     () => lifecycleManager.scheduleInactivityCheck(),
     () => messageQueue.processMessageQueue(),
@@ -788,6 +791,7 @@ export function createSessionRuntime(platform: SessionPlatform, env: Env): Sessi
   });
 
   const accessReader = new SessionAccessReader({
+    mayAccess: () => preservation.mayDispatch(),
     sessionCoreRepository,
     sandboxRepository,
     repoSecretsEncryptionKey,

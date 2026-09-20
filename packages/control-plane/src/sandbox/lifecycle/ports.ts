@@ -32,3 +32,10 @@ export type SandboxAlarmResult =
 export interface SandboxAlarm {
   handleAlarm(): Promise<SandboxAlarmResult>;
 }
+
+/** Capture completion is separate from the sandbox lifecycle status. */
+export type CheckpointOutcome =
+  | { kind: "completed"; operationId: string; imageId: string }
+  | { kind: "skipped"; reason: string }
+  | { kind: "failed"; reason: string }
+  | { kind: "unknown"; operationId: string; reason: string };

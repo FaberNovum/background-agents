@@ -36,6 +36,7 @@ import {
 /** Configuration for the WebSocket manager. */
 export interface WebSocketManagerConfig {
   authTimeoutMs: number;
+  mayDispatch?: () => boolean;
 }
 
 /** Ephemeral classification, not a dispatch permit that can survive an await. */
@@ -296,6 +297,7 @@ export class SessionWebSocketManagerImpl implements SessionWebSocketManager {
   }
 
   getSandboxCommandTarget(): SandboxCommandTarget {
+    if (this.config.mayDispatch && !this.config.mayDispatch()) return { kind: "unavailable" };
     const ws = this.getSandboxSocket();
     if (!ws) return { kind: "unavailable" };
     const sandbox = this.sandboxRepository.getSandbox();

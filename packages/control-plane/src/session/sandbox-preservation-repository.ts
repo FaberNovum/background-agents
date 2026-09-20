@@ -12,6 +12,31 @@ const receiptSchema = z.object({
   runtimeVersion: z.string().nullable(),
 });
 
+const checkpointIdentity = z.object({
+  version: z.literal(1),
+  operationId: z.string().min(1),
+  generation: sandboxGenerationSchema,
+  provider: z.string().min(1),
+  providerObjectId: z.string().min(1),
+  runtimeVersion: z.string().nullable(),
+  reason: z.string().min(1),
+  startedAtMs: z.number().finite(),
+  deadlineAtMs: z.number().finite(),
+  nonDestructive: z.literal(true),
+});
+
+/** The checkpoint and final operation share one record and one capture owner. */
+const checkpointSchema = z.discriminatedUnion("phase", [
+  checkpointIdentity.extend({ phase: z.literal("capturing") }),
+  checkpointIdentity.extend({ phase: z.literal("unknown"), error: z.string().min(1) }),
+  checkpointIdentity.extend({
+    phase: z.literal("completed"),
+    imageId: z.string().min(1),
+    savedAtMs: z.number().finite(),
+  }),
+]);
+export type CheckpointOperation = z.infer<typeof checkpointSchema>;
+
 const stateSchema = sandboxPreservationSchema
   .extend({
     generation: sandboxGenerationSchema,
@@ -24,6 +49,7 @@ const stateSchema = sandboxPreservationSchema
     generationReady: z.boolean(),
     runtimeReady: z.boolean().optional(),
     checkpointInFlight: z.boolean().optional(),
+    checkpoint: checkpointSchema.optional(),
     operationId: z.string().optional(),
     messageId: z.string().optional(),
     stopByMs: z.number().optional(),
@@ -32,6 +58,16 @@ const stateSchema = sandboxPreservationSchema
     receipt: receiptSchema.optional(),
   })
   .superRefine((state, context) => {
+    const checkpoint = state.checkpoint;
+    if (
+      checkpoint &&
+      (checkpoint.deadlineAtMs <= checkpoint.startedAtMs ||
+        checkpoint.generation.sandboxId !== state.generation.sandboxId ||
+        checkpoint.generation.createdAt !== state.generation.createdAt ||
+        checkpoint.provider !== state.provider ||
+        checkpoint.providerObjectId !== state.providerObjectId)
+    )
+      context.addIssue({ code: "custom", message: "Invalid checkpoint ownership" });
     const incomplete =
       (state.lifetimeKind === "finite" &&
         (state.expiresAtMs === null || state.drainAtMs === null)) ||

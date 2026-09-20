@@ -21,14 +21,13 @@ export interface SandboxRuntimeFacts {
   updateSandboxGitSyncStatus(status: GitSyncStatus): void;
 }
 
-/** Persistence used by final preservation without exposing the repository aggregate. */
+/** Capture facts for preservation; lifecycle transitions remain lifecycle-owned. */
 export interface SandboxPreservationStorage extends SandboxStateReader {
   recordSandboxSnapshot(
     sandboxId: string | null,
     snapshotId: string,
     runtimeVersion: string | null
   ): boolean;
-  updateSandboxStatus(status: SandboxStatus): void;
 }
 
 /** Aggregate initialization is separate from transitions of an existing sandbox. */

@@ -29,6 +29,53 @@ function repository() {
 }
 
 describe("SandboxPreservationRepository", () => {
+  const checkpoint = {
+    version: 1 as const,
+    operationId: "capture-1",
+    generation: { sandboxId: "sandbox-1", createdAt: 1_000 },
+    provider: "modal",
+    providerObjectId: "provider-1",
+    runtimeVersion: "v71-test",
+    reason: "execution_complete",
+    startedAtMs: 2_000,
+    deadlineAtMs: 9_000,
+    nonDestructive: true as const,
+    phase: "capturing" as const,
+  };
+
+  it("round-trips capture ownership, uncertainty and completion without another journal", () => {
+    const f = repository();
+    for (const operation of [
+      checkpoint,
+      { ...checkpoint, phase: "unknown" as const, error: "deadline" },
+      { ...checkpoint, phase: "completed" as const, imageId: "image", savedAtMs: 8_000 },
+    ]) {
+      const state = record({ provider: "modal", checkpoint: operation });
+      f.repository.write(state);
+      expect(f.repository.read()).toEqual(state);
+    }
+    f.db.close();
+  });
+
+  it.each([
+    { version: 2 },
+    { operationId: "" },
+    { generation: { sandboxId: "other", createdAt: 1_000 } },
+    { providerObjectId: "other" },
+    { provider: "other" },
+    { nonDestructive: false },
+    { deadlineAtMs: 1_000 },
+    { phase: "unknown" },
+    { phase: "completed" },
+  ])("rejects malformed checkpoint metadata %j without discarding its ownership", (bad) => {
+    const f = repository();
+    f.sql.exec(
+      "INSERT INTO sandbox_preservation (singleton, state) VALUES (1, ?)",
+      JSON.stringify(record({ provider: "modal", checkpoint: { ...checkpoint, ...bad } as never }))
+    );
+    expect(() => f.repository.read()).toThrow(SessionStorageIntegrityError);
+    f.db.close();
+  });
   it("distinguishes missing state from a stored running generation", () => {
     const fixture = repository();
     expect(fixture.repository.read()).toBeNull();
