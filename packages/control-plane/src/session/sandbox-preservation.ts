@@ -435,7 +435,7 @@ export class SandboxPreservation {
       return { kind: "unknown", operationId: operation.operationId, reason: error };
     } finally {
       if (this.checkpointOperation === operation.operationId) this.checkpointOperation = null;
-      if (this.readState()?.phase === "draining") this.kickAdvance();
+      if (this.readState()?.phase === "waiting_for_checkpoint") this.kickAdvance();
     }
   }
 
@@ -480,18 +480,23 @@ export class SandboxPreservation {
     if (!state || !this.current(state) || state.phase !== "running") return false;
     if (!this.providerMatches(state)) return true;
     const now = this.now();
-    const end = state.expiresAtMs ?? now + STOP_MS + CAPTURE_MS + RETIRE_MS + MARGIN_MS;
-    // A shorter buffer reduces capture time, not the prompt-stop allowance.
-    // Always leave room for source retirement and the final safety margin.
-    const stopByMs = Math.min(now + STOP_MS, end - RETIRE_MS - MARGIN_MS);
+    const waiting = this.unresolvedCheckpoint(state) || !!state.checkpointInFlight;
+    const waitEnd = waiting ? Math.max(now, state.checkpoint?.deadlineAtMs ?? now) : now;
+    const end = state.expiresAtMs ?? waitEnd + STOP_MS + CAPTURE_MS + RETIRE_MS + MARGIN_MS;
+    const retireByMs = end - MARGIN_MS;
     const next: PreservationRecord = {
       ...state,
-      phase: "draining",
+      phase: waiting ? "waiting_for_checkpoint" : "draining",
       reason,
       operationId: crypto.randomUUID(),
-      stopByMs,
-      captureByMs: Math.min(stopByMs + CAPTURE_MS, end - RETIRE_MS - MARGIN_MS),
-      retireByMs: end - MARGIN_MS,
+      ...(waiting
+        ? {
+            waitByMs: Math.min(waitEnd, retireByMs - RETIRE_MS - STOP_MS),
+            stopByMs: undefined,
+            captureByMs: undefined,
+          }
+        : this.preparationBudget(now, retireByMs)),
+      retireByMs,
     };
     const failure = this.deps.session.transaction(() => {
       const message = this.deps.messages.getProcessingMessage();
@@ -569,6 +574,40 @@ export class SandboxPreservation {
     let state = this.readState();
     if (!state || !this.current(state) || !state.operationId) return;
     if (!this.providerMatches(state)) return;
+    if (state.phase === "waiting_for_checkpoint") {
+      if (this.unresolvedCheckpoint(state) || state.checkpointInFlight) {
+        if (
+          state.checkpoint?.phase !== "capturing" ||
+          this.checkpointOperation !== state.checkpoint.operationId ||
+          this.now() >= state.waitByMs!
+        ) {
+          this.fail(
+            state,
+            "unknown",
+            "An earlier checkpoint has an unknown result or exceeded the final wait deadline."
+          );
+          return;
+        }
+        await this.deps.alarm.schedule(state.waitByMs!);
+        if (!this.owns(state)) return;
+        state = this.readState()!;
+        if (this.unresolvedCheckpoint(state)) return;
+      }
+      if (this.now() >= state.waitByMs!) {
+        this.fail(
+          state,
+          "failed",
+          "No preparation budget remains after waiting for the checkpoint."
+        );
+        return;
+      }
+      state = {
+        ...state,
+        phase: "draining",
+        ...this.preparationBudget(this.now(), state.retireByMs!),
+      };
+      this.publish(state);
+    }
     if (state.phase === "draining") {
       if (this.now() >= state.stopByMs!) {
         this.fail(
@@ -694,6 +733,11 @@ export class SandboxPreservation {
     } finally {
       this.activeOperation = null;
     }
+  }
+
+  private preparationBudget(now: number, retireByMs: number) {
+    const stopByMs = Math.min(now + STOP_MS, retireByMs - RETIRE_MS);
+    return { stopByMs, captureByMs: Math.min(stopByMs + CAPTURE_MS, retireByMs - RETIRE_MS) };
   }
 
   private async retire(state: PreservationRecord): Promise<void> {

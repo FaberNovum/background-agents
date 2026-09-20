@@ -2,6 +2,7 @@ import type { SandboxPreservationState } from "@open-inspect/shared/types/sandbo
 import { cn } from "@/lib/utils";
 
 const PHASE_MESSAGES: Record<Exclude<SandboxPreservationState["phase"], "running">, string> = {
+  waiting_for_checkpoint: "Waiting for the current checkpoint before saving final sandbox state.",
   draining: "Stopping the prompt to save your sandbox state.",
   prepared: "Prompt stopped. Preparing final sandbox state.",
   capturing: "Saving final sandbox state.",

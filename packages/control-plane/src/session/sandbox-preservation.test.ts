@@ -148,6 +148,68 @@ function preparedEvent(
 describe("SandboxPreservation", () => {
   beforeEach(() => vi.restoreAllMocks());
 
+  it("starts the final stop budget after a checkpoint taking longer than STOP_MS settles", async () => {
+    let complete!: (result: { success: boolean; imageId: string }) => void;
+    const takeSnapshot = vi.fn(
+      () =>
+        new Promise<{ success: boolean; imageId: string }>((resolve) => {
+          complete = resolve;
+        })
+    );
+    const f = fixture(provider({ takeSnapshot }));
+    await readyFinite(f);
+    const checkpoint = f.preservation.checkpoint("execution_complete");
+    await vi.waitFor(() => expect(takeSnapshot).toHaveBeenCalledOnce());
+    await f.preservation.request("final");
+    expect(f.store.value).toMatchObject({ phase: "waiting_for_checkpoint", waitByMs: 400_000 });
+    expect(f.store.value?.stopByMs).toBeUndefined();
+    f.setNow(161_000);
+    await f.preservation.handleAlarm();
+    expect(f.store.value?.phase).toBe("waiting_for_checkpoint");
+    complete({ success: true, imageId: "ordinary" });
+    await checkpoint;
+    await f.backgroundTasks.at(-1)!();
+    expect(f.store.value).toMatchObject({
+      phase: "draining",
+      stopByMs: 221_000,
+      captureByMs: 521_000,
+    });
+    expect(f.deps.sockets.send).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ type: "prepare_preservation", stopByMs: 221_000 })
+    );
+  });
+
+  it.each(["restart", "deadline"])(
+    "retains the wait hold on %s instead of starting another capture",
+    async (mode) => {
+      let complete!: (result: { success: boolean; imageId: string }) => void;
+      const takeSnapshot = vi.fn(
+        () =>
+          new Promise<{ success: boolean; imageId: string }>((resolve) => {
+            complete = resolve;
+          })
+      );
+      const f = fixture(provider({ takeSnapshot }));
+      await readyFinite(f);
+      const checkpoint = f.preservation.checkpoint("execution_complete");
+      await vi.waitFor(() => expect(takeSnapshot).toHaveBeenCalledOnce());
+      // Leave only 10 seconds of waiting before the hard lifetime budget must be reserved.
+      f.store.write({ ...f.store.value!, expiresAtMs: 230_000, drainAtMs: 200_000 });
+      await f.preservation.request("final");
+      expect(f.store.value?.waitByMs).toBe(110_000);
+      const owner = mode === "restart" ? new SandboxPreservation(f.deps as never) : f.preservation;
+      if (mode === "deadline") f.setNow(110_000);
+      await owner.handleAlarm();
+      expect(f.store.value?.phase).toBe("unknown");
+      expect(owner.mayDispatch()).toBe(false);
+      complete({ success: true, imageId: "ordinary" });
+      await checkpoint;
+      expect(f.store.value?.phase).toBe("unknown");
+      expect(takeSnapshot).toHaveBeenCalledOnce();
+    }
+  );
+
   it("keeps normal work ready, serializes capture, and records captured runtime provenance", async () => {
     let complete!: (result: { success: boolean; imageId: string }) => void;
     const takeSnapshot = vi.fn(

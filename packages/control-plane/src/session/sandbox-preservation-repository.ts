@@ -52,6 +52,7 @@ const stateSchema = sandboxPreservationSchema
     checkpoint: checkpointSchema.optional(),
     operationId: z.string().optional(),
     messageId: z.string().optional(),
+    waitByMs: z.number().finite().optional(),
     stopByMs: z.number().optional(),
     captureByMs: z.number().optional(),
     retireByMs: z.number().optional(),
@@ -69,6 +70,8 @@ const stateSchema = sandboxPreservationSchema
     )
       context.addIssue({ code: "custom", message: "Invalid checkpoint ownership" });
     const incomplete =
+      (state.phase === "waiting_for_checkpoint" &&
+        (!state.operationId || state.waitByMs === undefined || state.retireByMs === undefined)) ||
       (state.lifetimeKind === "finite" &&
         (state.expiresAtMs === null || state.drainAtMs === null)) ||
       ((state.phase === "saved" || state.phase === "retiring") && !state.receipt) ||
