@@ -103,6 +103,12 @@ function wireCheckpointOwner(
     messenger: broadcaster,
     alarm: createMockAlarmScheduler(),
     background: { submit: vi.fn() },
+    messages: { getProcessingMessage: () => null },
+    sockets: { getSandboxSocket: () => null, send: () => false },
+    reconcileStatus: async () => {},
+    processQueue: async () => {},
+    completePreservation: (generation: SandboxGeneration, objectId: string | null) =>
+      manager.completePreservation(generation, objectId),
   } as never);
   manager.setPreservation(preservation);
   return preservation;
@@ -604,6 +610,33 @@ async function expectEarlyBridgeStartup(kind: ProviderStartupKind): Promise<void
 // ==================== Tests ====================
 
 describe("final preservation lifecycle integration", () => {
+  it("leaves the heartbeat source attached when final preservation acquires it during capture", async () => {
+    let complete!: (result: SnapshotResult) => void;
+    const takeSnapshot = vi.fn(
+      () =>
+        new Promise<SnapshotResult>((resolve) => {
+          complete = resolve;
+        })
+    );
+    const stopSandbox = vi.fn(async () => ({ success: true }));
+    const p = createMockProvider({
+      takeSnapshot,
+      stopSandbox,
+      capabilities: { supportsExplicitStop: true, supportsPersistentResume: false },
+    });
+    const sandbox = createMockSandbox({ status: "ready", last_heartbeat: Date.now() - 100_000 });
+    const f = fixture(p, sandbox);
+    const owner = wireCheckpointOwner(f.manager, p, f.storage, createMockBroadcaster());
+    const alarm = f.manager.handleAlarm();
+    await vi.waitFor(() => expect(takeSnapshot).toHaveBeenCalledOnce());
+    await owner.request("inactivity_timeout");
+    expect(owner.snapshot()?.phase).toBe("waiting_for_checkpoint");
+    complete({ success: true, imageId: "heartbeat-image" });
+    expect(await alarm).toBe("no_action");
+    expect(stopSandbox).not.toHaveBeenCalled();
+    expect(f.sockets.detachSandboxWebSocket).not.toHaveBeenCalled();
+    expect(owner.recoveryReceipt()).toBeUndefined();
+  });
   function fixture(
     provider = createMockProvider(),
     sandbox = createMockSandbox({ status: "stopped" })
@@ -627,6 +660,7 @@ describe("final preservation lifecycle integration", () => {
       isHolding: vi.fn(() => false),
       request: vi.fn(async () => true),
       mayAcquire: vi.fn(() => true),
+      retireHeartbeatCheckpoint: vi.fn(async () => {}),
       checkpoint: vi.fn<SandboxPreservationLifecycle["checkpoint"]>(async () => ({
         kind: "skipped",
         reason: "test",
@@ -5588,6 +5622,7 @@ describe("status writes after a provider await (COL-99)", () => {
         isHolding: vi.fn(() => false),
         request: vi.fn(async () => true),
         mayAcquire: vi.fn(() => true),
+        retireHeartbeatCheckpoint: vi.fn(async () => {}),
         checkpoint: vi.fn<SandboxPreservationLifecycle["checkpoint"]>(async () => ({
           kind: "skipped",
           reason: "test",

@@ -455,6 +455,42 @@ export class SandboxPreservation {
     );
   }
 
+  /** Heartbeat recovery may retire its own checkpoint, never a final owner's source. */
+  async retireHeartbeatCheckpoint(operationId: string): Promise<void> {
+    const state = this.readState();
+    const checkpoint = state?.checkpoint;
+    if (
+      !state ||
+      state.phase !== "running" ||
+      !this.current(state) ||
+      checkpoint?.phase !== "completed" ||
+      checkpoint.operationId !== operationId ||
+      checkpoint.reason !== "heartbeat_timeout" ||
+      checkpoint.provider !== this.deps.provider.name ||
+      this.deps.sandbox.getSandbox()?.modal_object_id !== checkpoint.providerObjectId
+    )
+      return;
+    const retiring: PreservationRecord = {
+      ...state,
+      phase: "retiring",
+      operationId,
+      reason: "heartbeat_timeout",
+      retireByMs: Math.min(this.now() + RETIRE_MS, state.expiresAtMs ?? Infinity),
+      receipt: {
+        kind: "snapshot",
+        artifactId: checkpoint.imageId,
+        provider: checkpoint.provider,
+        savedAtMs: checkpoint.savedAtMs,
+        runtimeVersion: checkpoint.runtimeVersion,
+      },
+      savedAtMs: checkpoint.savedAtMs,
+    };
+    // Synchronous ownership acquisition precedes provider teardown. A final
+    // request cannot enter while retirement is awaiting its provider result.
+    this.publish(retiring);
+    await this.retire(retiring);
+  }
+
   async request(reason: string): Promise<boolean> {
     const state = this.readState();
     if (!state) {

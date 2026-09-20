@@ -148,6 +148,35 @@ function preparedEvent(
 describe("SandboxPreservation", () => {
   beforeEach(() => vi.restoreAllMocks());
 
+  it("claims heartbeat checkpoint retirement before yielding and rejects competing final ownership", async () => {
+    let stopped!: (result: { success: boolean }) => void;
+    const stopSandbox = vi.fn(
+      () =>
+        new Promise<{ success: boolean }>((resolve) => {
+          stopped = resolve;
+        })
+    );
+    const f = fixture(
+      provider({
+        takeSnapshot: vi.fn(async () => ({ success: true, imageId: "heartbeat-image" })),
+        stopSandbox,
+      })
+    );
+    await readyFinite(f);
+    f.sandboxRow.status = "stale";
+    const checkpoint = await f.preservation.checkpoint("heartbeat_timeout");
+    expect(checkpoint.kind).toBe("completed");
+    if (checkpoint.kind !== "completed") throw new Error("Expected completed capture");
+    const retiring = f.preservation.retireHeartbeatCheckpoint(checkpoint.operationId);
+    await vi.waitFor(() => expect(stopSandbox).toHaveBeenCalledOnce());
+    expect(f.store.value).toMatchObject({ phase: "retiring", operationId: checkpoint.operationId });
+    expect(await f.preservation.request("inactivity_timeout")).toBe(false);
+    stopped({ success: true });
+    await retiring;
+    expect(f.store.value).toMatchObject({ phase: "saved", sourceRetired: true });
+    expect(f.deps.completePreservation).toHaveBeenCalledOnce();
+  });
+
   it("starts the final stop budget after a checkpoint taking longer than STOP_MS settles", async () => {
     let complete!: (result: { success: boolean; imageId: string }) => void;
     const takeSnapshot = vi.fn(

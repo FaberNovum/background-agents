@@ -106,6 +106,7 @@ export interface SandboxPreservationLifecycle {
   mayAcquire(): boolean;
   request(reason: string): Promise<boolean>;
   checkpoint(reason: string): Promise<CheckpointOutcome>;
+  retireHeartbeatCheckpoint(operationId: string): Promise<void>;
   recoveryReceipt():
     | {
         kind: "snapshot" | "retained";
@@ -1594,8 +1595,10 @@ export class SandboxLifecycleManager
         }
       } else {
         const checkpoint = await this.triggerSnapshot("heartbeat_timeout");
-        if (this.preservation && checkpoint.kind !== "completed") {
-          await this.preservation.request("heartbeat_timeout");
+        if (this.preservation) {
+          if (checkpoint.kind === "completed")
+            await this.preservation.retireHeartbeatCheckpoint(checkpoint.operationId);
+          else await this.preservation.request("heartbeat_timeout");
           return "no_action";
         }
         if (this.canStopProviderSandbox()) {
