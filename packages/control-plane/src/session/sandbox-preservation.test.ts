@@ -634,6 +634,78 @@ describe("SandboxPreservation", () => {
     }
   });
 
+  it.each(["snapshot", "retained"] as const)(
+    "keeps a scheduling failure before %s provider I/O retryable",
+    async (mode) => {
+      const takeSnapshot = vi.fn(async () => ({
+        success: true,
+        imageId: "final-image",
+        sourceStopped: true,
+      }));
+      const stopSandbox = vi.fn(async () => ({ success: true }));
+      const f = fixture(
+        provider({
+          takeSnapshot,
+          stopSandbox,
+          capabilities: {
+            ...provider().capabilities,
+            supportsSnapshots: mode === "snapshot",
+            supportsPersistentResume: mode === "retained",
+          },
+        })
+      );
+      await readyFinite(f);
+      await f.preservation.request("sandbox_lifetime_expiring");
+      const firstOperation = f.store.value!.operationId;
+      f.preservation.prepared(preparedEvent(f.store.value!));
+      f.deps.alarm.schedule.mockRejectedValueOnce(new Error("Temporary alarm failure"));
+
+      await f.preservation.handleAlarm();
+
+      expect(f.store.value?.phase).toBe("failed");
+      expect(takeSnapshot).not.toHaveBeenCalled();
+      expect(stopSandbox).not.toHaveBeenCalled();
+      await f.preservation.recover("retry");
+      expect(f.store.value?.phase).toBe("draining");
+      expect(f.store.value?.operationId).not.toBe(firstOperation);
+      f.preservation.prepared(preparedEvent(f.store.value!));
+      await f.preservation.handleAlarm();
+      expect(f.store.value?.phase).toBe("saved");
+      expect(mode === "snapshot" ? takeSnapshot : stopSandbox).toHaveBeenCalledOnce();
+    }
+  );
+
+  it("keeps deadline exhaustion during alarm scheduling retryable before provider invocation", async () => {
+    const takeSnapshot = vi.fn();
+    const f = fixture(provider({ takeSnapshot }));
+    await readyFinite(f);
+    await f.preservation.request("sandbox_lifetime_expiring");
+    f.preservation.prepared(preparedEvent(f.store.value!));
+    f.deps.alarm.schedule.mockImplementationOnce(async () => {
+      f.setNow(f.store.value!.captureByMs!);
+    });
+    await f.preservation.handleAlarm();
+    expect(takeSnapshot).not.toHaveBeenCalled();
+    expect(f.store.value?.phase).toBe("failed");
+    await f.preservation.recover("retry");
+    expect(f.store.value?.phase).toBe("draining");
+  });
+
+  it("retains an unknown hold after provider invocation throws", async () => {
+    const takeSnapshot = vi.fn(async () => {
+      throw new Error("Connection lost after request");
+    });
+    const f = fixture(provider({ takeSnapshot }));
+    await readyFinite(f);
+    await f.preservation.request("sandbox_lifetime_expiring");
+    f.preservation.prepared(preparedEvent(f.store.value!));
+    await f.preservation.handleAlarm();
+    expect(takeSnapshot).toHaveBeenCalledOnce();
+    expect(f.store.value?.phase).toBe("unknown");
+    await expect(f.preservation.recover("retry")).rejects.toThrow("cannot be retried safely");
+    expect(takeSnapshot).toHaveBeenCalledOnce();
+  });
+
   it("retries only a confirmed pre-capture failure with a new operation", async () => {
     const f = fixture();
     await readyFinite(f);

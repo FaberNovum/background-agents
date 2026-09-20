@@ -704,6 +704,7 @@ export class SandboxPreservation {
     const runtimeVersion = this.deps.sandbox.getSandbox()?.runtime_version ?? null;
     const capturing = { ...state, phase: "capturing" as const };
     this.publish(capturing);
+    let providerInvoked = false;
     try {
       await this.deps.alarm.schedule(state.captureByMs!);
       if (!this.owns(capturing)) return;
@@ -721,16 +722,18 @@ export class SandboxPreservation {
       let sourceStopped = retained;
       if (retained) {
         if (!provider.stopSandbox) throw new Error("Provider cannot preserve-stop this sandbox");
-        const result = await this.bounded(state.captureByMs!, (signal) =>
-          provider.stopSandbox!({ ...common, intent: "preserve", signal })
-        );
+        const result = await this.bounded(state.captureByMs!, (signal) => {
+          providerInvoked = true;
+          return provider.stopSandbox!({ ...common, intent: "preserve", signal });
+        });
         if (!result.success)
           throw new Error(result.error ?? "Provider did not confirm preservation");
       } else {
         if (!provider.takeSnapshot) throw new Error("Provider has no snapshot operation");
-        const result = await this.bounded(state.captureByMs!, (signal) =>
-          provider.takeSnapshot!({ ...common, signal })
-        );
+        const result = await this.bounded(state.captureByMs!, (signal) => {
+          providerInvoked = true;
+          return provider.takeSnapshot!({ ...common, signal });
+        });
         if (!result.success || !result.imageId)
           throw new Error(result.error ?? "Provider did not return a ready snapshot");
         artifactId = result.imageId;
@@ -764,10 +767,12 @@ export class SandboxPreservation {
       if (this.owns(capturing))
         this.fail(
           capturing,
-          "unknown",
-          error instanceof PreservationDeadlineError
-            ? "Provider preservation deadline exceeded; result unknown."
-            : "The provider did not confirm final preservation. The previous recovery point is unchanged."
+          providerInvoked ? "unknown" : "failed",
+          !providerInvoked
+            ? "Final preservation failed before provider invocation and can be retried."
+            : error instanceof PreservationDeadlineError
+              ? "Provider preservation deadline exceeded; result unknown."
+              : "The provider did not confirm final preservation. The previous recovery point is unchanged."
         );
     } finally {
       this.activeOperation = null;
