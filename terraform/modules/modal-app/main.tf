@@ -16,6 +16,7 @@ resource "null_resource" "modal_secrets" {
     # Re-run when secrets configuration changes
     secrets_hash      = sha256(local.secrets_json)
     modal_environment = var.modal_environment
+    modal_workspace   = var.workspace
   }
 
   provisioner "local-exec" {
