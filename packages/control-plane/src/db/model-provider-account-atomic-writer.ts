@@ -280,14 +280,14 @@ export class D1ModelProviderAccountAtomicWriter implements ModelProviderAccountA
     ) {
       return { type: "target_changed" };
     }
-    const currentCredential = await this.credentials.readCredentialState(
+    const currentCredentialVersion = await this.credentials.readCredentialVersion(
       input.accountId,
       input.authorization.provider
     );
-    if (!currentCredential) return { type: "target_changed" };
+    if (currentCredentialVersion === null) return { type: "target_changed" };
 
     const encryptedPayload = await this.encryptDeviceCredential(input, input.accountId);
-    const nextCredentialVersion = currentCredential.credentialVersion + 1;
+    const nextCredentialVersion = currentCredentialVersion + 1;
     const nextLifecycleVersion = snapshot.lifecycleVersion + 1;
     const authorizationGuard = this.deviceAuthorizationGuard();
     const guardValues = this.deviceAuthorizationGuardValues(input.authorization, input.now);
@@ -315,7 +315,7 @@ export class D1ModelProviderAccountAtomicWriter implements ModelProviderAccountA
           snapshot.lifecycleVersion,
           ...guardValues,
           input.accountId,
-          currentCredential.credentialVersion
+          currentCredentialVersion
         ),
       this.db
         .prepare(
@@ -332,7 +332,7 @@ export class D1ModelProviderAccountAtomicWriter implements ModelProviderAccountA
           input.accessTokenExpiresAt,
           input.now,
           input.accountId,
-          currentCredential.credentialVersion
+          currentCredentialVersion
         ),
       this.connectedAuthorizationStatement({
         ...input,

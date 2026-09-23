@@ -167,6 +167,28 @@ export class ProviderCredentialStore {
     };
   }
 
+  async readCredentialVersion(
+    providerAccountId: string,
+    provider: ModelProviderId
+  ): Promise<number | null> {
+    assertModelProviderId(provider);
+    const row = await this.db
+      .prepare(
+        `SELECT credentials.credential_version
+         FROM model_provider_account_credentials credentials
+         JOIN model_provider_accounts accounts ON accounts.id = credentials.provider_account_id
+         WHERE credentials.provider_account_id = ? AND accounts.provider = ?`
+      )
+      .bind(providerAccountId, provider)
+      .first<{ credential_version: unknown }>();
+    if (row === null) return null;
+    const parsed = positiveIntegerSchema.safeParse(row.credential_version);
+    if (!parsed.success) {
+      throw new Error(`Malformed provider credential row for account ${providerAccountId}`);
+    }
+    return parsed.data;
+  }
+
   async replace(
     input: CredentialPayloadInput & { expectedCredentialVersion: number }
   ): Promise<boolean> {

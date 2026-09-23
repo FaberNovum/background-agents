@@ -48,7 +48,10 @@ async function makeDue(id: string): Promise<void> {
     .run();
 }
 
-async function seedAccount(externalAccountId = "acct-integration"): Promise<void> {
+async function seedAccount(
+  externalAccountId = "acct-integration",
+  encryptionKey = env.PROVIDER_ACCOUNTS_ENCRYPTION_KEY!
+): Promise<void> {
   const now = Date.now();
   await env.DB.prepare(
     `INSERT INTO model_provider_accounts
@@ -57,7 +60,7 @@ async function seedAccount(externalAccountId = "acct-integration"): Promise<void
   )
     .bind(ACCOUNT_ID, externalAccountId, now, now)
     .run();
-  await new ProviderCredentialStore(env.DB, env.PROVIDER_ACCOUNTS_ENCRYPTION_KEY!).create({
+  await new ProviderCredentialStore(env.DB, encryptionKey).create({
     providerAccountId: ACCOUNT_ID,
     provider: "openai",
     credentialSchemaVersion: 1,
@@ -189,6 +192,31 @@ describe("provider account device authorization routes", () => {
       account: { id: ACCOUNT_ID, displayName: "Preserved name", status: "active" },
       reconnectedExisting: true,
     });
+  });
+
+  it("replaces a credential encrypted with an obsolete key during reconnect", async () => {
+    await ensureAuthenticatedUser();
+    await seedAccount("acct-integration", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
+    const { result } = await start({ operation: "reconnect", providerAccountId: ACCOUNT_ID });
+    await makeDue(result.transactionId);
+
+    const response = await request(
+      `/model-provider-accounts/openai/device-authorizations/${result.transactionId}/poll`,
+      "POST"
+    );
+    await expect(response.json()).resolves.toMatchObject({
+      status: "connected",
+      account: { id: ACCOUNT_ID, status: "active" },
+      reconnectedExisting: true,
+    });
+    const credential = await new ProviderCredentialStore(
+      env.DB,
+      env.PROVIDER_ACCOUNTS_ENCRYPTION_KEY!
+    ).readCredentialState(ACCOUNT_ID, "openai");
+    expect(credential ? parseOpenAICredential(credential).refreshToken : undefined).toBe(
+      "integration-openai-rotated-refresh"
+    );
+    expect(credential?.credentialVersion).toBe(2);
   });
 
   it("converges duplicate creates on the trusted external identity", async () => {
