@@ -64,7 +64,8 @@
     "undici": "^7.29.1",
     "sharp": "^0.35.5",
     "postcss-selector-parser": "^7.1.6",
-    "glob": "^14.0.3"
+    "glob": "^14.0.3",
+    "fflate": "^0.7.5"
   },
   "lint-staged": {
     "*.{ts,tsx}": [
