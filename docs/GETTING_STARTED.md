@@ -136,8 +136,8 @@ npm install -g wrangler
 
 ## Step 1: Fork the Repository
 
-Fork [ColeMurray/background-agents](https://github.com/ColeMurray/background-agents) to your GitHub
-account or organization.
+Fork [open-inspect/background-agents](https://github.com/open-inspect/background-agents) to your
+GitHub account or organization.
 
 ```bash
 # Clone your fork

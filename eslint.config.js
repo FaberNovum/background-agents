@@ -59,6 +59,8 @@ export default tseslint.config(
     ignores: [
       "**/node_modules/**",
       "**/dist/**",
+      "**/.cloudflare/**",
+      "**/.vinext/**",
       "**/.next/**",
       "**/.source/**",
       "**/build/**",

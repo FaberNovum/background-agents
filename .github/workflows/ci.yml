@@ -234,6 +234,9 @@ jobs:
       - name: Build docs package
         run: npm run build -w @open-inspect/docs
 
+      - name: Build docs package for Cloudflare (vinext)
+        run: npm run build:vinext -w @open-inspect/docs
+
   test-cp-unit:
     name: Test (control-plane unit)
     runs-on: ubuntu-latest
