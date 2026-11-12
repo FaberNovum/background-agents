@@ -63,11 +63,15 @@ const ZEN_MODELS = [
   "opencode/glm-5",
   "opencode/glm-5.1",
   "opencode/glm-5.2",
+  "opencode/gemini-4-carbon",
+  "opencode/gemini-4-argon",
+  "opencode/gemini-3.8-flash",
 ] as const;
 
 const GO_MODELS = [
   "opencode-go/grok-4.6",
   "opencode-go/gpt-5.6-luna",
+  "opencode-go/gemini-4-argon",
   "opencode-go/glm-5.3-flash",
   "opencode-go/glm-5.3",
   "opencode-go/glm-5.2",

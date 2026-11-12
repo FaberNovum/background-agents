@@ -1,7 +1,11 @@
 {
   "opencode/kimi-k3": ["low", "high", "max"],
   "opencode/glm-5.2": ["high", "max"],
+  "opencode/gemini-4-carbon": ["low", "medium", "high"],
+  "opencode/gemini-4-argon": ["low", "medium", "high"],
+  "opencode/gemini-3.8-flash": ["low", "medium", "high"],
   "opencode-go/gpt-5.6-luna": ["none", "low", "medium", "high", "xhigh", "max"],
+  "opencode-go/gemini-4-argon": ["low", "medium", "high"],
   "opencode-go/glm-5.3-flash": ["low", "high", "max"],
   "opencode-go/glm-5.3": ["low", "high", "max"],
   "opencode-go/glm-5.2": ["high", "max"],

@@ -15,9 +15,9 @@ GPT-6.1 Sol added from the 2026-09-29 retrieval.
 Source SHA-256: e4677e698a53d3b8b11c569c0ecc2f5722cd8126677bf5f7dbff23daf942a17b
 GPT-6.1 Terra added from the 2026-11-04 retrieval.
 Source SHA-256: 3c98c4ea4ce2fc866e8f7cf858f7c79ce96d12aa190b6f26b9af77b448519b02
-OpenCode Zen and Go models with efforts added from the 2026-11-10 retrieval.
+OpenCode Zen and Go models with efforts, and their Gemini models, added from the 2026-11-10 retrieval.
 Source SHA-256: 4f9cc07fff594ef0745e8c243fc0c5a0b68b2279b0d062cca5c8a3df6382e0ed
-Subset SHA-256: eb88d4c5d807e16092fcf49efc172ecfda8d6e2a77f6cc1314965373faec3f6e
+Subset SHA-256: f12f327e696beaaba07bed4123c2c9ab330e7c83bd422cde26e61d3e99822136
 Reconcile this frozen fixture with shared model/effort definitions when changing
 models or the binary. Mocks verify serialization, not live provider acceptance.
 """
@@ -112,6 +112,22 @@ def chat_completion_events(model):
     ]
 
 
+def google_events():
+    """Minimal Gemini streamGenerateContent stream that replies OK."""
+    return [
+        {
+            "candidates": [
+                {"content": {"role": "model", "parts": [{"text": "OK"}]}, "finishReason": "STOP"}
+            ],
+            "usageMetadata": {
+                "promptTokenCount": 1,
+                "candidatesTokenCount": 1,
+                "totalTokenCount": 2,
+            },
+        }
+    ]
+
+
 def anthropic_events(model):
     return [
         {
@@ -150,6 +166,10 @@ async def wire_server(tmp_path, reasoning_config, request):
 
         def do_POST(self):
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            google = ":streamGenerateContent" in self.path
+            if google:
+                # Google's API names the model in the path, not the body.
+                body["model"] = self.path.split("/models/", 1)[1].split(":", 1)[0]
             captured.append(
                 {
                     key: body.get(key)
@@ -159,6 +179,7 @@ async def wire_server(tmp_path, reasoning_config, request):
                         "thinking",
                         "output_config",
                         "reasoning_effort",
+                        "generationConfig",
                         "system",
                         "tools",
                     )
@@ -167,6 +188,13 @@ async def wire_server(tmp_path, reasoning_config, request):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.end_headers()
+            if google:
+                self.wfile.write(
+                    "".join(
+                        "data: " + json.dumps(event) + "\n\n" for event in google_events()
+                    ).encode()
+                )
+                return
             if self.path.endswith("/chat/completions"):
                 self.wfile.write(
                     "".join(
@@ -419,10 +447,18 @@ async def test_opencode_gateway_efforts_reach_provider(wire_server):
         npm = (catalog[provider]["models"][model_id].get("provider") or {}).get("npm")
         sent, _ = submit(call, captured, model, None)
         assert sent["reasoning_effort"] is None, model
+        if npm == "@ai-sdk/google":
+            # OpenCode sends Gemini's high thinking level when no variant is
+            # chosen; the shared catalog records that as the default.
+            thinking = sent["generationConfig"]["thinkingConfig"]
+            assert thinking["thinkingLevel"] == "high", model
         for effort in efforts:
             sent, _ = submit(call, captured, model, effort)
             context = f"{model} {effort}"
-            if npm == "@ai-sdk/openai":
+            if npm == "@ai-sdk/google":
+                thinking = sent["generationConfig"]["thinkingConfig"]
+                assert thinking["thinkingLevel"] == effort, context
+            elif npm == "@ai-sdk/openai":
                 assert sent["reasoning"]["effort"] == effort, context
             elif npm == "@ai-sdk/anthropic" and model_id == "qwen3.7-plus":
                 # Budget-only model: OpenCode (pinned in OPENCODE_VERSION) maps its

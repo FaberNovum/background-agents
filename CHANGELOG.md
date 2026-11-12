@@ -4,6 +4,13 @@ New features, integrations, and notable improvements to Open-Inspect — newest 
 
 ## November 10, 2026
 
+**Gemini on OpenCode Zen and Go.** Gemini 4 Carbon, Gemini 4 Argon, and Gemini 3.8 Flash are
+available in the opt-in OpenCode Zen group, and Gemini 4 Argon in the OpenCode Go group, using the
+existing `OPENCODE_API_KEY`. Each offers low, medium, and high reasoning effort, defaulting to high,
+the level OpenCode already sent for them. Gemini 4 Carbon was released on November 10; images whose
+model catalog was fetched before then may not list it, so rebuild one if a session reports the model
+as not found.
+
 **Reasoning effort on OpenCode Zen and Go.** Zen and Go models whose catalog entries list reasoning
 levels now show an Effort selector, among them Kimi K3, GLM 5.2 and 5.3, DeepSeek V4.1 Flash,
 DeepSeek V4 Pro, Qwen3.8, Muse Spark, Hy3, and GPT 5.6 Luna on Go. The selected effort was
