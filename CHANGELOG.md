@@ -2,6 +2,16 @@
 
 New features, integrations, and notable improvements to Open-Inspect — newest first.
 
+## November 10, 2026
+
+**Reasoning effort on OpenCode Zen and Go.** Zen and Go models whose catalog entries list reasoning
+levels now show an Effort selector, among them Kimi K3, GLM 5.2 and 5.3, DeepSeek V4.1 Flash,
+DeepSeek V4 Pro, Qwen3.8, Muse Spark, Hy3, and GPT 5.6 Luna on Go. The selected effort was
+previously dropped for these providers. None has a default, so a session with no effort sends none.
+An effort carried over from an earlier message, a saved Slack preference or a parent session now
+reaches these models when they support that level, as it already did for Anthropic and OpenAI: a
+session on Claude at max that switches to GLM 5.2 runs GLM at max.
+
 ## October 31, 2026
 
 **Kimi Coding Plan models.** Kimi K3.1 Pro, K3, Kimi for Coding, and their Highspeed and 256K

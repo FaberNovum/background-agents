@@ -15,7 +15,9 @@ GPT-6.1 Sol added from the 2026-09-29 retrieval.
 Source SHA-256: e4677e698a53d3b8b11c569c0ecc2f5722cd8126677bf5f7dbff23daf942a17b
 GPT-6.1 Terra added from the 2026-11-04 retrieval.
 Source SHA-256: 3c98c4ea4ce2fc866e8f7cf858f7c79ce96d12aa190b6f26b9af77b448519b02
-Subset SHA-256: fbc59c3d17de9575cd489fd67a4f6da4e9c73caa971d1738fc3b968cb5ffb52b
+OpenCode Zen and Go models with efforts added from the 2026-11-10 retrieval.
+Source SHA-256: 4f9cc07fff594ef0745e8c243fc0c5a0b68b2279b0d062cca5c8a3df6382e0ed
+Subset SHA-256: eb88d4c5d807e16092fcf49efc172ecfda8d6e2a77f6cc1314965373faec3f6e
 Reconcile this frozen fixture with shared model/effort definitions when changing
 models or the binary. Mocks verify serialization, not live provider acceptance.
 """
@@ -41,6 +43,17 @@ pytest_plugins = ["tests.test_reasoning_config"]
 BINARY = os.environ.get("OPENCODE_TEST_BINARY")
 pytestmark = pytest.mark.skipif(not BINARY, reason="set OPENCODE_TEST_BINARY for wire tests")
 CATALOG = Path(__file__).parent / "fixtures/reasoning-models.json"
+OPENCODE_GATEWAYS = ("opencode", "opencode-go")
+# The agent-level effort the wire server configures; a prompt without a usable
+# variant falls back to it.
+AGENT_DEFAULT_EFFORT = "high"
+# Efforts the shared catalog offers on OpenCode Zen and Go. The shared package's
+# models.test.ts keeps this file equal to the catalog. Each must be a variant
+# OpenCode derives for the model; the field it lands in depends on the SDK the
+# gateway routes the model to.
+OPENCODE_GATEWAY_EFFORTS = json.loads(
+    (Path(__file__).parent / "fixtures/opencode-gateway-efforts.json").read_text()
+)
 
 
 def openai_events(model):
@@ -78,6 +91,24 @@ def openai_events(model):
         },
         {"type": "response.output_item.done", "output_index": 0, "item": item},
         {"type": "response.completed", "response": response},
+    ]
+
+
+def chat_completion_events(model):
+    """Minimal OpenAI-compatible chat-completions stream that replies OK."""
+    chunk = {"id": "chatcmpl_test", "object": "chat.completion.chunk", "created": 0, "model": model}
+    return [
+        {
+            **chunk,
+            "choices": [
+                {"index": 0, "delta": {"role": "assistant", "content": "OK"}, "finish_reason": None}
+            ],
+        },
+        {
+            **chunk,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        },
     ]
 
 
@@ -127,19 +158,29 @@ async def wire_server(tmp_path, reasoning_config, request):
                         "reasoning",
                         "thinking",
                         "output_config",
+                        "reasoning_effort",
                         "system",
                         "tools",
                     )
                 }
             )
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            if self.path.endswith("/chat/completions"):
+                self.wfile.write(
+                    "".join(
+                        "data: " + json.dumps(event) + "\n\n"
+                        for event in chat_completion_events(body["model"])
+                    ).encode()
+                    + b"data: [DONE]\n\n"
+                )
+                return
             events = (
                 anthropic_events(body["model"])
                 if self.path.endswith("/messages")
                 else openai_events(body["model"])
             )
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.end_headers()
             self.wfile.write(
                 "".join(
                     "event: " + event["type"] + "\ndata: " + json.dumps(event) + "\n\n"
@@ -170,8 +211,9 @@ async def wire_server(tmp_path, reasoning_config, request):
                 "_bridge-client.js",
             ):
                 shutil.copy(source / name, destination / name)
-        config["agent"] = {"build": {"options": {"reasoningEffort": "high"}}}
-        for provider in ("openai", "anthropic"):
+        if getattr(request, "param", None) != "no_agent_default":
+            config["agent"] = {"build": {"options": {"reasoningEffort": AGENT_DEFAULT_EFFORT}}}
+        for provider in ("openai", "anthropic", *OPENCODE_GATEWAYS):
             config["provider"].setdefault(provider, {})["options"] = {
                 "baseURL": f"http://127.0.0.1:{mock.server_port}/v1",
                 "apiKey": "test-only",
@@ -190,6 +232,7 @@ async def wire_server(tmp_path, reasoning_config, request):
                 "OPENCODE_CLIENT": "serve",
                 "OPENAI_API_KEY": "test-only",
                 "ANTHROPIC_API_KEY": "test-only",
+                "OPENCODE_API_KEY": "test-only",
                 "SANDBOX_AUTH_TOKEN": "test-only",
                 "SESSION_CONFIG": '{"session_id":"wire-test"}',
             }
@@ -272,6 +315,8 @@ async def test_all_fixture_efforts_reach_provider(wire_server):
     call, captured = wire_server
     catalog = json.loads(CATALOG.read_text())
     for provider, group in catalog.items():
+        if provider in OPENCODE_GATEWAYS:
+            continue
         for model_id, model in group["models"].items():
             manual = model_id in {"claude-haiku-4-5", "claude-sonnet-4-5", "claude-opus-4-5"}
             efforts = (
@@ -352,3 +397,51 @@ async def test_unsupported_request_options_do_not_override_defaults(wire_server)
         )
         assert not result["info"].get("error")
         assert captured[-1]["thinking"] is None
+
+
+@pytest.mark.parametrize("wire_server", ["no_agent_default"], indirect=True)
+async def test_opencode_gateway_efforts_reach_provider(wire_server):
+    """Every catalog effort on a Zen or Go model reaches the gateway request.
+
+    Runs without an agent default effort, so a dropped variant cannot pass by
+    coincidence with the default.
+    """
+    call, captured = wire_server
+    catalog = json.loads(CATALOG.read_text())
+    fixture_models = {
+        f"{provider}/{model_id}"
+        for provider in OPENCODE_GATEWAYS
+        for model_id in catalog[provider]["models"]
+    }
+    assert fixture_models == set(OPENCODE_GATEWAY_EFFORTS)
+    for model, efforts in OPENCODE_GATEWAY_EFFORTS.items():
+        provider, model_id = model.split("/", 1)
+        npm = (catalog[provider]["models"][model_id].get("provider") or {}).get("npm")
+        sent, _ = submit(call, captured, model, None)
+        assert sent["reasoning_effort"] is None, model
+        for effort in efforts:
+            sent, _ = submit(call, captured, model, effort)
+            context = f"{model} {effort}"
+            if npm == "@ai-sdk/openai":
+                assert sent["reasoning"]["effort"] == effort, context
+            elif npm == "@ai-sdk/anthropic" and model_id == "qwen3.7-plus":
+                # Budget-only model: OpenCode (pinned in OPENCODE_VERSION) maps its
+                # high and max variants to these thinking budgets.
+                assert sent["thinking"] == {
+                    "type": "enabled",
+                    "budget_tokens": 16000 if effort == "high" else 31999,
+                }, context
+            elif npm == "@ai-sdk/anthropic":
+                assert sent["output_config"]["effort"] == effort, context
+            else:
+                assert sent["reasoning_effort"] == effort, context
+
+
+async def test_opencode_ignores_a_variant_the_model_lacks(wire_server):
+    """A variant the model lacks falls back to the agent default, not an error.
+
+    An image's cached catalog can predate a model's effort options.
+    """
+    call, captured = wire_server
+    sent, _ = submit(call, captured, "opencode/glm-5.2", "low")
+    assert sent["reasoning_effort"] == AGENT_DEFAULT_EFFORT

@@ -83,16 +83,22 @@ instructions.
 OpenCode Zen models require `OPENCODE_API_KEY` as a global or repository secret. Zen is
 pay-per-token against `https://opencode.ai/zen/v1`.
 
+Reasoning efforts on Zen and Go models are the effort levels the models.dev catalog lists for each
+model. A model the catalog marks only as reasoning on or off, such as LongCat 2.0, has none. None of
+them has a default effort, so the gateway's own default applies unless the session has one. That
+includes an effort carried over from an earlier message, a saved Slack preference or a parent
+session, which is sent whenever the new model supports that level.
+
 | Model ID                | Display name | Description   | Reasoning efforts | Default effort |
 | ----------------------- | ------------ | ------------- | ----------------- | -------------- |
 | `opencode/kimi-k2.5`    | Kimi K2.5    | Moonshot AI   | Not supported     | N/A            |
 | `opencode/kimi-k2.6`    | Kimi K2.6    | Moonshot AI   | Not supported     | N/A            |
-| `opencode/kimi-k3`      | Kimi K3      | Moonshot AI   | Not supported     | N/A            |
+| `opencode/kimi-k3`      | Kimi K3      | Moonshot AI   | low, high, max    | Not set        |
 | `opencode/minimax-m2.5` | MiniMax M2.5 | MiniMax       | Not supported     | N/A            |
 | `opencode/qwen3.7-max`  | Qwen3.7 Max  | Alibaba Cloud | Not supported     | N/A            |
 | `opencode/glm-5`        | GLM 5        | Z.ai 744B MoE | Not supported     | N/A            |
 | `opencode/glm-5.1`      | GLM 5.1      | Z.ai          | Not supported     | N/A            |
-| `opencode/glm-5.2`      | GLM 5.2      | Z.ai          | Not supported     | N/A            |
+| `opencode/glm-5.2`      | GLM 5.2      | Z.ai          | high, max         | Not set        |
 
 ## OpenCode Go
 
@@ -114,35 +120,35 @@ documents `minimax-m2.5`, but the OpenCode release pinned in
 (`opencode models` lists 27 Go models, not 28), so it is left out rather than offered as a selection
 that fails. That model is reachable as `opencode/minimax-m2.5` on Zen.
 
-| Model ID                                   | Display name                 | Description                   | Reasoning efforts | Default effort |
-| ------------------------------------------ | ---------------------------- | ----------------------------- | ----------------- | -------------- |
-| `opencode-go/grok-4.6`                     | Grok 4.6                     | xAI                           | Not supported     | N/A            |
-| `opencode-go/gpt-5.6-luna`                 | GPT 5.6 Luna                 | OpenAI                        | Not supported     | N/A            |
-| `opencode-go/glm-5.3-flash`                | GLM 5.3 Flash                | Z.ai                          | Not supported     | N/A            |
-| `opencode-go/glm-5.3`                      | GLM 5.3                      | Z.ai                          | Not supported     | N/A            |
-| `opencode-go/glm-5.2`                      | GLM 5.2                      | Z.ai                          | Not supported     | N/A            |
-| `opencode-go/glm-5.1`                      | GLM 5.1                      | Z.ai                          | Not supported     | N/A            |
-| `opencode-go/kimi-k3`                      | Kimi K3                      | Moonshot AI                   | Not supported     | N/A            |
-| `opencode-go/kimi-k2.7-code`               | Kimi K2.7 Code               | Moonshot AI                   | Not supported     | N/A            |
-| `opencode-go/kimi-k2.6`                    | Kimi K2.6                    | Moonshot AI                   | Not supported     | N/A            |
-| `opencode-go/longcat-2.0`                  | LongCat 2.0                  | Meituan                       | Not supported     | N/A            |
-| `opencode-go/deepseek-v4.1-flash`          | DeepSeek V4.1 Flash          | DeepSeek                      | Not supported     | N/A            |
-| `opencode-go/deepseek-v4-pro`              | DeepSeek V4 Pro              | DeepSeek                      | Not supported     | N/A            |
-| `opencode-go/deepseek-v4-flash`            | DeepSeek V4 Flash            | DeepSeek                      | Not supported     | N/A            |
-| `opencode-go/deepseek-v4-flash-vision-exp` | DeepSeek V4 Flash Vision Exp | DeepSeek, experimental vision | Not supported     | N/A            |
-| `opencode-go/mimo-v2.5`                    | MiMo V2.5                    | Xiaomi                        | Not supported     | N/A            |
-| `opencode-go/mimo-v2.5-pro`                | MiMo V2.5 Pro                | Xiaomi                        | Not supported     | N/A            |
-| `opencode-go/minimax-m3`                   | MiniMax M3                   | MiniMax                       | Not supported     | N/A            |
-| `opencode-go/minimax-m2.7`                 | MiniMax M2.7                 | MiniMax                       | Not supported     | N/A            |
-| `opencode-go/muse-spark-1.3-contributor`   | Muse Spark 1.3 Contributor   | Multimodal contributor tier   | Not supported     | N/A            |
-| `opencode-go/muse-spark-1.2-contributor`   | Muse Spark 1.2 Contributor   | Multimodal contributor tier   | Not supported     | N/A            |
-| `opencode-go/qwen3.8-max`                  | Qwen3.8 Max                  | Alibaba Cloud                 | Not supported     | N/A            |
-| `opencode-go/qwen3.8-flash`                | Qwen3.8 Flash                | Alibaba Cloud                 | Not supported     | N/A            |
-| `opencode-go/qwen3.7-max`                  | Qwen3.7 Max                  | Alibaba Cloud                 | Not supported     | N/A            |
-| `opencode-go/qwen3.7-plus`                 | Qwen3.7 Plus                 | Alibaba Cloud                 | Not supported     | N/A            |
-| `opencode-go/qwen3.6-plus`                 | Qwen3.6 Plus                 | Alibaba Cloud                 | Not supported     | N/A            |
-| `opencode-go/hy4-preview`                  | Hy4 Preview                  | Tencent Hunyuan               | Not supported     | N/A            |
-| `opencode-go/hy3`                          | Hy3                          | Tencent Hunyuan               | Not supported     | N/A            |
+| Model ID                                   | Display name                 | Description                   | Reasoning efforts                   | Default effort |
+| ------------------------------------------ | ---------------------------- | ----------------------------- | ----------------------------------- | -------------- |
+| `opencode-go/grok-4.6`                     | Grok 4.6                     | xAI                           | Not supported                       | N/A            |
+| `opencode-go/gpt-5.6-luna`                 | GPT 5.6 Luna                 | OpenAI                        | none, low, medium, high, xhigh, max | Not set        |
+| `opencode-go/glm-5.3-flash`                | GLM 5.3 Flash                | Z.ai                          | low, high, max                      | Not set        |
+| `opencode-go/glm-5.3`                      | GLM 5.3                      | Z.ai                          | low, high, max                      | Not set        |
+| `opencode-go/glm-5.2`                      | GLM 5.2                      | Z.ai                          | high, max                           | Not set        |
+| `opencode-go/glm-5.1`                      | GLM 5.1                      | Z.ai                          | Not supported                       | N/A            |
+| `opencode-go/kimi-k3`                      | Kimi K3                      | Moonshot AI                   | max                                 | Not set        |
+| `opencode-go/kimi-k2.7-code`               | Kimi K2.7 Code               | Moonshot AI                   | Not supported                       | N/A            |
+| `opencode-go/kimi-k2.6`                    | Kimi K2.6                    | Moonshot AI                   | Not supported                       | N/A            |
+| `opencode-go/longcat-2.0`                  | LongCat 2.0                  | Meituan                       | Not supported                       | N/A            |
+| `opencode-go/deepseek-v4.1-flash`          | DeepSeek V4.1 Flash          | DeepSeek                      | low, high, max                      | Not set        |
+| `opencode-go/deepseek-v4-pro`              | DeepSeek V4 Pro              | DeepSeek                      | high, max                           | Not set        |
+| `opencode-go/deepseek-v4-flash`            | DeepSeek V4 Flash            | DeepSeek                      | Not supported                       | N/A            |
+| `opencode-go/deepseek-v4-flash-vision-exp` | DeepSeek V4 Flash Vision Exp | DeepSeek, experimental vision | Not supported                       | N/A            |
+| `opencode-go/mimo-v2.5`                    | MiMo V2.5                    | Xiaomi                        | Not supported                       | N/A            |
+| `opencode-go/mimo-v2.5-pro`                | MiMo V2.5 Pro                | Xiaomi                        | Not supported                       | N/A            |
+| `opencode-go/minimax-m3`                   | MiniMax M3                   | MiniMax                       | Not supported                       | N/A            |
+| `opencode-go/minimax-m2.7`                 | MiniMax M2.7                 | MiniMax                       | Not supported                       | N/A            |
+| `opencode-go/muse-spark-1.3-contributor`   | Muse Spark 1.3 Contributor   | Multimodal contributor tier   | low, medium, high, xhigh            | Not set        |
+| `opencode-go/muse-spark-1.2-contributor`   | Muse Spark 1.2 Contributor   | Multimodal contributor tier   | low, medium, high, xhigh            | Not set        |
+| `opencode-go/qwen3.8-max`                  | Qwen3.8 Max                  | Alibaba Cloud                 | low, medium, xhigh                  | Not set        |
+| `opencode-go/qwen3.8-flash`                | Qwen3.8 Flash                | Alibaba Cloud                 | low, medium, xhigh                  | Not set        |
+| `opencode-go/qwen3.7-max`                  | Qwen3.7 Max                  | Alibaba Cloud                 | Not supported                       | N/A            |
+| `opencode-go/qwen3.7-plus`                 | Qwen3.7 Plus                 | Alibaba Cloud                 | high, max                           | Not set        |
+| `opencode-go/qwen3.6-plus`                 | Qwen3.6 Plus                 | Alibaba Cloud                 | Not supported                       | N/A            |
+| `opencode-go/hy4-preview`                  | Hy4 Preview                  | Tencent Hunyuan               | none, high                          | Not set        |
+| `opencode-go/hy3`                          | Hy3                          | Tencent Hunyuan               | none, low, high                     | Not set        |
 
 Some of these models are reachable through more than one provider, billed against different
 credentials. `opencode-go/grok-4.6` and `xai/grok-4.6` are the same Grok model behind different

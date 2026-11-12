@@ -106,6 +106,28 @@ const KIMI_CODE_PLAN_MODELS = [
 ] as const;
 const ZAI_CODING_PLAN_MODELS = ["zai-coding-plan/glm-5.2", "zai-coding-plan/glm-5.3"] as const;
 
+it("keeps the OpenCode gateway wire-test efforts aligned with the catalog", () => {
+  const fixture = JSON.parse(
+    readFileSync(
+      new URL(
+        "../../sandbox-runtime/tests/fixtures/opencode-gateway-efforts.json",
+        import.meta.url
+      ),
+      "utf8"
+    )
+  );
+  const expected = Object.fromEntries(
+    MODEL_CATALOG.flatMap((group) => group.models)
+      .filter(
+        (model) =>
+          (model.id.startsWith("opencode/") || model.id.startsWith("opencode-go/")) &&
+          "reasoning" in model
+      )
+      .map((model) => [model.id, [...model.reasoning.efforts]])
+  );
+  expect(fixture).toEqual(expected);
+});
+
 it.each([
   "../../../docs/AVAILABLE_MODELS.md",
   "../../../packages/docs/content/docs/models/choosing-a-model.mdx",

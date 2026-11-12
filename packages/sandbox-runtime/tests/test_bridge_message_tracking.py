@@ -112,6 +112,8 @@ class TestBuildPromptRequestBody:
             ("claude-haiku-4-5", "high"),
             ("anthropic/claude-opus-5", "xhigh"),
             ("openai/gpt-5.6-sol", "none"),
+            ("opencode/glm-5.2", "max"),
+            ("opencode-go/qwen3.8-max", "xhigh"),
         ],
     )
     def test_reasoning_effort_uses_variant(self, bridge: AgentBridge, model: str, effort: str):
