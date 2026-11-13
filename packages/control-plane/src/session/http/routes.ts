@@ -26,6 +26,7 @@ export interface SessionInternalRouteHandlers {
   snapshot: SessionInternalRouteHandler;
   sandboxAccess: SessionInternalRouteHandler;
   prompt: SessionInternalRouteHandler;
+  promptRequest: SessionInternalRouteHandler;
   autofix: SessionInternalRouteHandler;
   stop: SessionInternalRouteHandler;
   sandboxEvent: SessionInternalRouteHandler;
@@ -36,6 +37,7 @@ export interface SessionInternalRouteHandlers {
   listEvents: SessionInternalRouteHandler;
   listArtifacts: SessionInternalRouteHandler;
   listMessages: SessionInternalRouteHandler;
+  exportTrace: SessionInternalRouteHandler;
   createPr: SessionInternalRouteHandler;
   pullRequestArtifactSnapshot: SessionInternalRouteHandler;
   pullRequestsRefresh: SessionInternalRouteHandler;
@@ -45,6 +47,8 @@ export interface SessionInternalRouteHandlers {
   archive: SessionInternalRouteHandler;
   unarchive: SessionInternalRouteHandler;
   expireDraft: SessionInternalRouteHandler;
+  mcpContext: SessionInternalRouteHandler;
+  mcpClose: SessionInternalRouteHandler;
   verifySandboxToken: SessionInternalRouteHandler;
   openaiTokenRefresh: SessionInternalRouteHandler;
   xaiTokenRefresh: SessionInternalRouteHandler;
@@ -52,6 +56,7 @@ export interface SessionInternalRouteHandlers {
   tunnelUrls: SessionInternalRouteHandler;
   spawnContext: SessionInternalRouteHandler;
   activePromptAuthor: SessionInternalRouteHandler;
+  memoryPromptContext: SessionInternalRouteHandler;
   childSummary: SessionInternalRouteHandler;
   parentPrompt: SessionInternalRouteHandler;
   cancel: SessionInternalRouteHandler;
@@ -71,6 +76,8 @@ export function createSessionInternalRoutes(
   handlers: SessionInternalRouteHandlers
 ): SessionInternalRoute[] {
   return [
+    { method: "POST", path: SessionInternalPaths.mcpContext, handler: handlers.mcpContext },
+    { method: "POST", path: SessionInternalPaths.mcpClose, handler: handlers.mcpClose },
     { method: "POST", path: SessionInternalPaths.init, handler: handlers.init },
     { method: "GET", path: SessionInternalPaths.state, handler: handlers.state },
     { method: "GET", path: SessionInternalPaths.snapshot, handler: handlers.snapshot },
@@ -80,6 +87,7 @@ export function createSessionInternalRoutes(
       handler: handlers.sandboxAccess,
     },
     { method: "POST", path: SessionInternalPaths.prompt, handler: handlers.prompt },
+    { method: "GET", path: SessionInternalPaths.promptRequest, handler: handlers.promptRequest },
     { method: "POST", path: SessionInternalPaths.autofix, handler: handlers.autofix },
     { method: "POST", path: SessionInternalPaths.stop, handler: handlers.stop },
     { method: "POST", path: SessionInternalPaths.sandboxEvent, handler: handlers.sandboxEvent },
@@ -98,6 +106,7 @@ export function createSessionInternalRoutes(
     { method: "GET", path: SessionInternalPaths.events, handler: handlers.listEvents },
     { method: "GET", path: SessionInternalPaths.artifacts, handler: handlers.listArtifacts },
     { method: "GET", path: SessionInternalPaths.messages, handler: handlers.listMessages },
+    { method: "GET", path: SessionInternalPaths.traceExport, handler: handlers.exportTrace },
     { method: "POST", path: SessionInternalPaths.createPr, handler: handlers.createPr },
     {
       method: "POST",
@@ -141,6 +150,11 @@ export function createSessionInternalRoutes(
       method: "GET",
       path: SessionInternalPaths.activePromptAuthor,
       handler: handlers.activePromptAuthor,
+    },
+    {
+      method: "GET",
+      path: SessionInternalPaths.memoryPromptContext,
+      handler: handlers.memoryPromptContext,
     },
     { method: "GET", path: SessionInternalPaths.childSummary, handler: handlers.childSummary },
     { method: "POST", path: SessionInternalPaths.parentPrompt, handler: handlers.parentPrompt },

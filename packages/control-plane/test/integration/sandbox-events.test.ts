@@ -1,8 +1,79 @@
-import { describe, it, expect } from "vitest";
-import { initSession, queryDO, seedMessage } from "./helpers";
-import { runInSessionDO } from "./session-do-access";
+import { env } from "cloudflare:test";
+import { describe, it, expect, vi } from "vitest";
+import { SessionIndexStore } from "../../src/db/session-index";
+import {
+  initNamedSession,
+  initSession,
+  openSandboxWs,
+  queryDO,
+  seedMessage,
+  seedSandboxAuth,
+  waitForSandboxStatus,
+  closeWebSocket,
+} from "./helpers";
+import { componentsOf, runInSessionDO } from "./session-do-access";
 
 describe("POST /internal/sandbox-event", () => {
+  it("stores step usage received over the sandbox WebSocket without duplicating a resent step", async () => {
+    const name = `usage-${crypto.randomUUID()}`;
+    const { stub } = await initNamedSession(name);
+    const sandboxId = "sandbox-usage";
+    const authToken = "usage-test-token";
+    await seedSandboxAuth(stub, { sandboxId, authToken });
+    const { ws, response } = await openSandboxWs(name, { sandboxId, authToken });
+    expect(response.status).toBe(101);
+    expect(ws).not.toBeNull();
+    ws!.accept();
+    const event = {
+      type: "step_finish",
+      sandboxId,
+      messageId: "msg-usage",
+      stepId: "step-usage",
+      timestamp: 1000,
+      tokens: { input: 5, output: 0 },
+      cost: 0.01,
+    };
+    ws!.send(JSON.stringify(event));
+    await vi.waitFor(async () => {
+      const rows = await queryDO<{ id: string }>(stub, "SELECT id FROM step_usage");
+      expect(rows).toHaveLength(1);
+    });
+    ws!.send(JSON.stringify({ ...event, timestamp: 1001 }));
+    await vi.waitFor(async () => {
+      const session = await queryDO<{ total_cost: number }>(stub, "SELECT total_cost FROM session");
+      expect(session[0].total_cost).toBeCloseTo(0.02);
+    });
+    await vi.waitFor(async () => {
+      const rows = await queryDO<{ id: string; input_tokens: number; output_tokens: number }>(
+        stub,
+        "SELECT id, input_tokens, output_tokens FROM step_usage"
+      );
+      expect(rows).toEqual([{ id: "step-usage", input_tokens: 5, output_tokens: 0 }]);
+    });
+    // OpenCode omits unknown tokens and reason rather than sending nulls.
+    ws!.send(
+      JSON.stringify({
+        type: "step_finish",
+        sandboxId,
+        messageId: "msg-usage",
+        timestamp: 1002,
+        cost: 0.01,
+        messageCostUsd: 0.03,
+      })
+    );
+    await vi.waitFor(async () => {
+      const rows = await queryDO<{
+        id: string;
+        total_tokens: number | null;
+        reason: string | null;
+      }>(stub, "SELECT id, total_tokens, reason FROM step_usage ORDER BY id");
+      expect(rows).toEqual([
+        { id: "msg-usage:1002", total_tokens: null, reason: null },
+        { id: "step-usage", total_tokens: 5, reason: null },
+      ]);
+    });
+    await closeWebSocket(ws!);
+  });
   it("stores token event", async () => {
     const { stub } = await initSession();
 
@@ -180,7 +251,6 @@ describe("POST /internal/sandbox-event", () => {
       body: JSON.stringify({
         type: "heartbeat",
         sandboxId: "sb-1",
-        status: "running",
         timestamp: Date.now() / 1000,
       }),
     });
@@ -214,7 +284,6 @@ describe("POST /internal/sandbox-event", () => {
       body: JSON.stringify({
         type: "heartbeat",
         sandboxId: "sb-1",
-        status: "running",
         timestamp: Date.now() / 1000,
       }),
     });
@@ -233,6 +302,54 @@ describe("POST /internal/sandbox-event", () => {
       "SELECT type FROM events WHERE type = 'heartbeat'"
     );
     expect(events).toHaveLength(0);
+  });
+
+  it("keeps a quiet unattended turn alive through heartbeats beyond the inactivity timeout", async () => {
+    const { stub } = await initNamedSession(`quiet-automation-${crypto.randomUUID()}`, {
+      spawnSource: "automation",
+    });
+    await seedSandboxAuth(stub, { sandboxId: "quiet-sandbox", authToken: "quiet-token" });
+    const [{ id: authorId }] = await queryDO<{ id: string }>(
+      stub,
+      "SELECT id FROM participants LIMIT 1"
+    );
+    const startedAt = Date.now();
+    await seedMessage(stub, {
+      id: "quiet-turn",
+      authorId,
+      content: "Wait for a quiet tool",
+      source: "automation",
+      status: "processing",
+      createdAt: startedAt,
+      startedAt,
+    });
+
+    await runInSessionDO(stub, async (instance) => {
+      const { lifecycleManager, sandboxEventProcessor, sandboxRepository } = componentsOf(instance);
+      const clock = vi.spyOn(Date, "now");
+      lifecycleManager.updateLastActivity(startedAt);
+      try {
+        // Only heartbeats arrive throughout this turn, including beyond the idle cutoff.
+        for (let elapsedMs = 30_000; elapsedMs <= 180_000; elapsedMs += 30_000) {
+          const now = startedAt + elapsedMs;
+          clock.mockReturnValue(now);
+          await sandboxEventProcessor.processSandboxEvent({
+            type: "heartbeat",
+            sandboxId: "quiet-sandbox",
+            timestamp: now / 1000,
+          });
+          clock.mockReturnValue(now + 29_000);
+          await expect(lifecycleManager.handleAlarm()).resolves.toBe("no_action");
+          expect(sandboxRepository.getSandbox()).toMatchObject({
+            status: "ready",
+            last_activity: now,
+          });
+        }
+      } finally {
+        clock.mockRestore();
+      }
+    });
+    expect(await queryDO(stub, "SELECT id FROM events WHERE type = 'heartbeat'")).toEqual([]);
   });
 
   it("applies generated session title without storing a timeline event", async () => {
@@ -329,6 +446,258 @@ describe("POST /internal/sandbox-event", () => {
 
     const sessions = await queryDO<{ status: string }>(stub, "SELECT status FROM session LIMIT 1");
     expect(sessions[0].status).toBe("completed");
+  });
+
+  it("disables failed native MCP cleanup before advancing the queue", async () => {
+    const { stub } = await initSession();
+    const [{ id: authorId }] = await queryDO<{ id: string }>(
+      stub,
+      "SELECT id FROM participants LIMIT 1"
+    );
+    await seedMessage(stub, {
+      id: "msg-mcp-cleanup",
+      authorId,
+      content: "Use managed MCP",
+      source: "web",
+      status: "processing",
+      createdAt: Date.now() - 1000,
+      startedAt: Date.now() - 500,
+    });
+    await queryDO(stub, "UPDATE sandbox SET mcp_runtime_version = 1");
+
+    await runInSessionDO(stub, async (instance, state) => {
+      const { messageQueue, sandboxEventProcessor } = componentsOf(instance);
+      const processMessageQueue = vi
+        .spyOn(messageQueue, "processMessageQueue")
+        .mockImplementation(async () => {
+          expect(
+            state.storage.sql.exec("SELECT mcp_runtime_version FROM sandbox").toArray()
+          ).toEqual([{ mcp_runtime_version: -1 }]);
+        });
+      try {
+        await sandboxEventProcessor.processSandboxEvent({
+          type: "execution_complete",
+          messageId: "msg-mcp-cleanup",
+          success: false,
+          managedMcpReady: false,
+          sandboxId: "sb-1",
+          timestamp: Date.now() / 1000,
+        });
+        expect(processMessageQueue).toHaveBeenCalledOnce();
+      } finally {
+        processMessageQueue.mockRestore();
+      }
+    });
+  });
+
+  it("projects reported step tokens to the session index when the turn settles", async () => {
+    const { stub, sessionName } = await initSession();
+    const participants = await queryDO<{ id: string }>(
+      stub,
+      "SELECT id FROM participants WHERE user_id = 'user-1'"
+    );
+    const msgId = "msg-token-totals";
+    await seedMessage(stub, {
+      id: msgId,
+      authorId: participants[0].id,
+      content: "Test prompt",
+      source: "web",
+      status: "processing",
+      createdAt: Date.now() - 1000,
+      startedAt: Date.now() - 500,
+    });
+    const postEvent = (event: Record<string, unknown>) =>
+      stub.fetch("http://internal/internal/sandbox-event", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sandboxId: "sb-1", messageId: msgId, ...event }),
+      });
+
+    for (const [stepId, input] of [
+      ["step-1", 100],
+      ["step-2", 250],
+    ] as const) {
+      const res = await postEvent({
+        type: "step_finish",
+        stepId,
+        timestamp: Date.now() / 1000,
+        tokens: { input, output: 40, reasoning: 5, cache: { read: 800, write: 60 } },
+      });
+      expect(res.status).toBe(200);
+    }
+    const res = await postEvent({
+      type: "execution_complete",
+      success: true,
+      timestamp: Date.now() / 1000,
+    });
+    expect(res.status).toBe(200);
+
+    await vi.waitFor(async () => {
+      const session = await new SessionIndexStore(env.DB).get(sessionName);
+      expect(session).toMatchObject({
+        inputTokens: 350,
+        outputTokens: 80,
+        reasoningTokens: 10,
+        cacheReadTokens: 1600,
+        cacheWriteTokens: 120,
+      });
+    });
+  });
+
+  it("projects a step that finishes after a stop settled the session", async () => {
+    const { stub, sessionName } = await initSession();
+    const participants = await queryDO<{ id: string }>(
+      stub,
+      "SELECT id FROM participants WHERE user_id = 'user-1'"
+    );
+    const msgId = "msg-late-step";
+    await seedMessage(stub, {
+      id: msgId,
+      authorId: participants[0].id,
+      content: "Test prompt",
+      source: "web",
+      status: "processing",
+      createdAt: Date.now() - 1000,
+      startedAt: Date.now() - 500,
+    });
+    const postEvent = (event: Record<string, unknown>) =>
+      stub.fetch("http://internal/internal/sandbox-event", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sandboxId: "sb-1", messageId: msgId, ...event }),
+      });
+    const stepFinish = (stepId: string, input: number) =>
+      postEvent({
+        type: "step_finish",
+        stepId,
+        timestamp: Date.now() / 1000,
+        tokens: { input, output: 40, reasoning: 5, cache: { read: 800, write: 60 } },
+      });
+    const index = new SessionIndexStore(env.DB);
+
+    expect((await stepFinish("step-1", 100)).status).toBe(200);
+    // Stop settles the session before the sandbox has seen the stop command.
+    expect((await stub.fetch("http://internal/internal/stop", { method: "POST" })).status).toBe(
+      200
+    );
+    await vi.waitFor(async () => {
+      expect(await index.get(sessionName)).toMatchObject({ status: "failed", inputTokens: 100 });
+    });
+
+    // A step already in flight lands after the settle; its terminal is then a no-op.
+    expect((await stepFinish("step-2", 250)).status).toBe(200);
+    const res = await postEvent({
+      type: "execution_complete",
+      success: false,
+      error: "Task was cancelled",
+      timestamp: Date.now() / 1000,
+    });
+    expect(res.status).toBe(200);
+
+    await vi.waitFor(async () => {
+      expect(await index.get(sessionName)).toMatchObject({
+        inputTokens: 350,
+        outputTokens: 80,
+        reasoningTokens: 10,
+        cacheReadTokens: 1600,
+        cacheWriteTokens: 120,
+      });
+    });
+  });
+
+  it("projects a budget-stopped turn's steps while a queued prompt waits on the budget", async () => {
+    const { stub, sessionName } = await initSession({ sandboxSettings: { maxSessionCostUsd: 1 } });
+    await waitForSandboxStatus(stub, "failed");
+    const [{ id: authorId }] = await queryDO<{ id: string }>(
+      stub,
+      "SELECT id FROM participants WHERE user_id = 'user-1'"
+    );
+    const stoppedId = "msg-budget-stopped";
+    const queuedId = "msg-budget-queued";
+    await seedMessage(stub, {
+      id: stoppedId,
+      authorId,
+      content: "Running prompt",
+      source: "web",
+      status: "processing",
+      createdAt: Date.now() - 1000,
+      startedAt: Date.now() - 500,
+    });
+    await seedMessage(stub, {
+      id: queuedId,
+      authorId,
+      content: "Queued prompt",
+      source: "web",
+      status: "pending",
+      createdAt: Date.now() - 900,
+    });
+    await queryDO(stub, "UPDATE session SET status = 'active'");
+    const postEvent = (event: Record<string, unknown>) =>
+      stub.fetch("http://internal/internal/sandbox-event", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sandboxId: "sb-1", messageId: stoppedId, ...event }),
+      });
+    const stepFinish = (stepId: string, input: number, messageCostUsd: number) =>
+      postEvent({
+        type: "step_finish",
+        stepId,
+        timestamp: Date.now() / 1000,
+        tokens: { input, output: 40, reasoning: 5, cache: { read: 800, write: 60 } },
+        messageCostUsd,
+      });
+    const index = new SessionIndexStore(env.DB);
+
+    expect((await stepFinish("step-1", 100, 0.4)).status).toBe(200);
+    // This step reaches the limit: the budget stops the turn, and the queued
+    // prompt keeps the session active but cannot dispatch. The stopped turn is
+    // projected anyway, since no settle is coming.
+    expect((await stepFinish("step-2", 200, 1.2)).status).toBe(200);
+    await vi.waitFor(async () => {
+      expect(await index.get(sessionName)).toMatchObject({ inputTokens: 300 });
+    });
+    // A step already in flight lands after the stop, then the sandbox's own terminal.
+    expect((await stepFinish("step-3", 250, 1.5)).status).toBe(200);
+    const terminal = await postEvent({
+      type: "execution_complete",
+      success: false,
+      error: "Task was cancelled",
+      timestamp: Date.now() / 1000,
+    });
+    expect(terminal.status).toBe(200);
+
+    expect(await queryDO(stub, "SELECT status, budget_exhausted FROM session")).toEqual([
+      { status: "active", budget_exhausted: 1 },
+    ]);
+    expect(await queryDO(stub, "SELECT id, status FROM messages ORDER BY created_at")).toEqual([
+      { id: stoppedId, status: "failed" },
+      { id: queuedId, status: "pending" },
+    ]);
+    const tokenKinds = [
+      "inputTokens",
+      "outputTokens",
+      "reasoningTokens",
+      "cacheReadTokens",
+      "cacheWriteTokens",
+    ] as const;
+    const exported = await stub.fetch("http://internal/internal/trace-export?include=usage");
+    expect(exported.status).toBe(200);
+    const { trace } = await exported.json<{
+      trace: { usage: Array<Record<(typeof tokenKinds)[number], number | null>> };
+    }>();
+    const usageTotals = Object.fromEntries(
+      tokenKinds.map((kind) => [kind, trace.usage.reduce((sum, row) => sum + (row[kind] ?? 0), 0)])
+    );
+    expect(usageTotals).toEqual({
+      inputTokens: 550,
+      outputTokens: 120,
+      reasoningTokens: 15,
+      cacheReadTokens: 2400,
+      cacheWriteTokens: 180,
+    });
+    await vi.waitFor(async () => {
+      expect(await index.get(sessionName)).toMatchObject(usageTotals);
+    });
   });
 
   it("execution_complete with success=false marks message as failed", async () => {

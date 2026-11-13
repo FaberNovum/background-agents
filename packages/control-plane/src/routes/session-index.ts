@@ -1,3 +1,4 @@
+import { isWorkspaceAdmin } from "@open-inspect/shared/rbac";
 import { parseBody } from "./body";
 import { Hono } from "hono";
 import { z } from "zod";
@@ -5,19 +6,25 @@ import { admit, dispatch } from "../routing/admit";
 import type { ControlPlaneHonoEnv } from "../routing/hono-env";
 import {
   parseSessionListQuery,
+  parseSessionListTeamIds,
   SESSION_LIST_CURRENT_USER,
 } from "@open-inspect/shared/session-list-query";
 import {
   SESSION_INBOX_CATEGORIES,
   sessionInboxCategorySchema,
+  sessionInboxMarkReadRequestSchema,
+  sessionInboxMarkReadResponseSchema,
   sessionInboxPageSchema,
-  sessionInboxSnapshotSchema,
+  type SessionInboxMarkReadRequest,
 } from "@open-inspect/shared/types/session-inbox";
+import type { SessionViewer } from "@open-inspect/shared";
+import { sessionVisibilitySchema } from "@open-inspect/shared/types/teams";
 import {
   sessionListResponseSchema,
   sessionReadActionSchema,
 } from "@open-inspect/shared/types/sessions";
 import { isCanonicalUserId } from "@open-inspect/shared/user-id";
+import { canonicalUserIdOf } from "../auth/principal";
 import { SessionIndexStore } from "../db/session-index";
 import {
   error,
@@ -25,6 +32,7 @@ import {
   json,
   SCM_AGNOSTIC_HUMAN_USER_ROUTE,
   requirePermission,
+  requireSession,
   type RequestContext,
   type UserRouteContext,
 } from "./shared";
@@ -32,6 +40,17 @@ import type { Env } from "../types";
 import { createLogger } from "../logger";
 import { encodeSessionInboxCursor, parseSessionInboxCursor } from "../db/session-inbox-cursor";
 import { parseQuery } from "./query";
+import { TeamMembershipStore } from "../db/team-memberships";
+import { D1QueryParameterLimitError } from "../db/query-limits";
+import {
+  effectiveSessionCapabilities,
+  teamsEnforcementMode,
+  viewerFromContext,
+} from "../authorization/session-admission";
+import { SessionCollaboratorStore } from "../db/session-collaborators";
+import type { TeamsEnforcementMode } from "../authorization/teams-enforcement";
+import type { InboxFilterOptions, ListSessionInboxResult } from "../db/session-inbox-store";
+import { recordShadowListDenials } from "../authorization/session-shadow-audit";
 
 const sessionInboxQuerySchema = z.object({
   category: z
@@ -48,10 +67,24 @@ const sessionInboxQuerySchema = z.object({
     }),
   cursor: z.string().min(1, { error: "Invalid cursor" }).optional(),
   mine: z.literal("true", { error: "Invalid mine" }).optional(),
+  ownerFilter: z
+    .enum(["started", "participating", "anyone"], { error: "Invalid ownerFilter" })
+    .optional(),
+  visibility: z.enum(sessionVisibilitySchema.options, { error: "Invalid visibility" }).optional(),
+  scope: z.enum(["workspace", "all"], { error: "Invalid scope" }).optional(),
 });
 
 const log = createLogger("session-read-state");
-const SESSION_INBOX_LIMIT = 20;
+export const SESSION_INBOX_LIMIT = 20;
+
+async function readSessionList<T>(read: () => Promise<T>): Promise<T | Response> {
+  try {
+    return await read();
+  } catch (cause) {
+    if (cause instanceof D1QueryParameterLimitError) return error(cause.message, 400);
+    throw cause;
+  }
+}
 
 function parseCreatedByFilters(
   values: readonly string[],
@@ -86,31 +119,95 @@ export async function handleListSessions(
   const parsedQuery = parseSessionListQuery(url.searchParams);
   if (!parsedQuery.success) return error(`Invalid ${parsedQuery.invalidParam}`, 400);
 
-  const { createdBy, status, excludeStatus, excludeAutomationLineage, limit, offset } =
-    parsedQuery.data;
-  const viewerUserId =
-    ctx.principal?.kind === "user"
-      ? ctx.principal.userId
-      : ctx.principal?.kind === "service"
-        ? (ctx.principal.actor?.canonicalUserId ?? ctx.authorization?.userId)
-        : undefined;
-  const createdByUserIds = parseCreatedByFilters(createdBy, viewerUserId ?? null);
+  const {
+    createdBy,
+    status,
+    excludeStatus,
+    excludeAutomationLineage,
+    q,
+    repoOwner,
+    repoName,
+    environmentId,
+    origin,
+    limit,
+    offset,
+    teamIds,
+    ownerFilter,
+    visibility,
+    scope,
+  } = parsedQuery.data;
+  const viewerUserId = canonicalUserIdOf(ctx.principal) ?? ctx.authorization?.userId;
+  const legacyStarted =
+    ownerFilter === undefined &&
+    createdBy.length === 1 &&
+    createdBy[0] === SESSION_LIST_CURRENT_USER;
+  if (legacyStarted && !isCanonicalUserId(viewerUserId)) return error("Invalid createdBy", 400);
+  const createdByUserIds = parseCreatedByFilters(
+    legacyStarted ? [] : createdBy,
+    viewerUserId ?? null
+  );
 
   if (createdByUserIds instanceof Response) {
     return createdByUserIds;
   }
 
+  const viewer = viewerFromContext(
+    ctx,
+    ctx.authorization
+      ? (ctx.sessionMemberships ??= await new TeamMembershipStore(ctx.db).listForUser(
+          ctx.authorization.userId
+        ))
+      : new Map()
+  );
+  if (scope === "all" && (viewer.kind !== "user" || !isWorkspaceAdmin(viewer.roleKey))) {
+    return error("Invalid scope", 403);
+  }
+  if (ownerFilter && ownerFilter !== "anyone" && viewer.kind !== "user") {
+    return error("Invalid ownerFilter", 400);
+  }
+
   const store = new SessionIndexStore(ctx.db);
   const listStartedAt = Date.now();
-  const result = await store.list({
-    status,
-    excludeStatus,
-    excludeAutomationLineage,
-    createdByUserIds,
-    limit,
-    offset,
-    ...(viewerUserId ? { viewerUserId } : {}),
-  });
+  const result = await readSessionList(() =>
+    store.list({
+      status,
+      excludeStatus,
+      excludeAutomationLineage,
+      createdByUserIds,
+      ...(teamIds ? { teamIds } : {}),
+      ownerFilter: ownerFilter ?? (legacyStarted ? "started" : "anyone"),
+      visibility,
+      scope,
+      readScope: viewer,
+      mode: teamsEnforcementMode(ctx, env),
+      ...(q ? { search: q } : {}),
+      ...(repoOwner && repoName ? { repository: { repoOwner, repoName } } : {}),
+      ...(environmentId ? { environmentId } : {}),
+      ...(origin ? { spawnSource: origin } : {}),
+      limit,
+      offset,
+      ...(viewerUserId ? { viewerUserId } : {}),
+    })
+  );
+  if (result instanceof Response) return result;
+  const collaborators = await new SessionCollaboratorStore(ctx.db).listForSessions(
+    result.sessions.map((row) => row.id),
+    { privateOnly: true }
+  );
+  const sessions = result.sessions.map((row) => ({
+    ...row,
+    capabilities: effectiveSessionCapabilities(
+      viewer,
+      {
+        id: row.id,
+        ownerUserId: row.userId ?? null,
+        ownerTeamId: row.ownerTeamId,
+        visibility: row.visibility,
+        collaboratorIds: collaborators.get(row.id) ?? [],
+      },
+      teamsEnforcementMode(ctx, env)
+    ),
+  }));
   if (viewerUserId) {
     log.info("session_read_state.decorated", {
       event: "session_read_state.decorated",
@@ -123,68 +220,115 @@ export async function handleListSessions(
 
   const response = json(
     sessionListResponseSchema.parse({
-      sessions: result.sessions,
+      sessions,
       hasMore: result.hasMore,
     })
   );
   if (viewerUserId) {
     response.headers.set("Cache-Control", "private, no-store");
   }
+  recordShadowListDenials(ctx, viewer, result.sessions, teamsEnforcementMode(ctx, env));
   return response;
+}
+
+/** The viewer-scoped options shared by every query over the viewer's inbox. */
+async function resolveInboxFilterOptions(
+  env: Env,
+  ctx: UserRouteContext,
+  filters: SessionInboxMarkReadRequest
+): Promise<(InboxFilterOptions & { readScope: SessionViewer }) | Response> {
+  const viewer = viewerFromContext(
+    ctx,
+    (ctx.sessionMemberships ??= await new TeamMembershipStore(ctx.db).listForUser(
+      ctx.principal.userId
+    ))
+  );
+  if (filters.scope === "all" && (viewer.kind !== "user" || !isWorkspaceAdmin(viewer.roleKey))) {
+    return error("Invalid scope", 403);
+  }
+  return {
+    createdByUserIds: filters.mine ? [ctx.principal.userId] : [],
+    excludeAutomatedSessions: filters.mine === true,
+    viewerUserId: ctx.principal.userId,
+    readScope: viewer,
+    mode: teamsEnforcementMode(ctx, env),
+    teamIds: filters.teamIds,
+    ownerFilter: filters.ownerFilter,
+    visibility: filters.visibility,
+    scope: filters.scope,
+  };
 }
 
 export async function handleListSessionInbox(
   request: Request,
-  _env: Env,
+  env: Env,
   _params: object,
   ctx: UserRouteContext
 ): Promise<Response> {
   const query = parseQuery(request, sessionInboxQuerySchema);
   if (query instanceof Response) return query;
-  const { category, mine } = query;
+  const { category, mine, ownerFilter, visibility, scope } = query;
   if (query.cursor !== undefined && category === null) {
     return error("Category required for pagination", 400);
   }
   const parsedCursor = parseSessionInboxCursor(query.cursor);
   if (!parsedCursor.ok) return error(parsedCursor.error, 400);
+  const teamIds = parseSessionListTeamIds(new URL(request.url).searchParams);
+  if (teamIds === null) {
+    return error("Invalid teamIds[]", 400);
+  }
+  const filterOptions = await resolveInboxFilterOptions(env, ctx, {
+    mine: mine === "true",
+    teamIds,
+    ownerFilter,
+    visibility,
+    scope,
+  });
+  if (filterOptions instanceof Response) return filterOptions;
+  const { readScope: viewer, mode } = filterOptions;
 
   const startedAt = Date.now();
   const store = new SessionIndexStore(ctx.db);
-  const commonOptions = {
-    limit: SESSION_INBOX_LIMIT,
-    createdByUserIds: mine === "true" ? [ctx.principal.userId] : [],
-    excludeAutomatedSessions: mine === "true",
-    viewerUserId: ctx.principal.userId,
-  };
+  const commonOptions = { ...filterOptions, limit: SESSION_INBOX_LIMIT };
 
   if (category === null) {
-    const snapshot = await store.listInboxSnapshot(commonOptions);
-    const body = sessionInboxSnapshotSchema.parse({
+    const snapshot = await readSessionList(() => store.listInboxSnapshot(commonOptions));
+    if (snapshot instanceof Response) return snapshot;
+    const body = {
       categories: Object.fromEntries(
-        SESSION_INBOX_CATEGORIES.map((inboxCategory) => [
-          inboxCategory,
-          encodeInboxPage(snapshot[inboxCategory]),
-        ])
+        await Promise.all(
+          SESSION_INBOX_CATEGORIES.map(async (inboxCategory) => [
+            inboxCategory,
+            await encodeInboxPage(snapshot[inboxCategory], ctx, viewer, mode),
+          ])
+        )
       ),
-    });
+    };
     const response = json(body);
     response.headers.set("Cache-Control", "private, no-store");
+    for (const page of Object.values(snapshot)) {
+      recordShadowListDenials(
+        ctx,
+        viewer,
+        page.items.flatMap(({ rootSession, descendantSessions }) => [
+          rootSession,
+          ...descendantSessions,
+        ]),
+        mode
+      );
+    }
     return response;
   }
 
-  const result = await store.listInbox({
-    ...commonOptions,
-    category,
-    cursor: parsedCursor.cursor,
-  });
-  const nextCursor = result.nextCursor ? encodeSessionInboxCursor(result.nextCursor) : null;
-  const response = json(
-    sessionInboxPageSchema.parse({
-      items: result.items,
-      hasMore: result.hasMore,
-      nextCursor,
+  const result = await readSessionList(() =>
+    store.listInbox({
+      ...commonOptions,
+      category,
+      cursor: parsedCursor.cursor,
     })
   );
+  if (result instanceof Response) return result;
+  const response = json(await encodeInboxPage(result, ctx, viewer, mode));
   response.headers.set("Cache-Control", "private, no-store");
   log.info("session_inbox.listed", {
     event: "session_inbox.listed",
@@ -198,15 +342,52 @@ export async function handleListSessionInbox(
     request_id: ctx.request_id,
     trace_id: ctx.trace_id,
   });
+  recordShadowListDenials(
+    ctx,
+    viewer,
+    result.items.flatMap(({ rootSession, descendantSessions }) => [
+      rootSession,
+      ...descendantSessions,
+    ]),
+    mode
+  );
   return response;
 }
 
-function encodeInboxPage(result: Awaited<ReturnType<SessionIndexStore["listInbox"]>>) {
-  return {
-    items: result.items,
+async function encodeInboxPage(
+  result: ListSessionInboxResult,
+  ctx: RequestContext,
+  viewer: SessionViewer,
+  mode: TeamsEnforcementMode
+) {
+  const sessions = result.items.flatMap((item) => [item.rootSession, ...item.descendantSessions]);
+  const collaborators = await new SessionCollaboratorStore(ctx.db).listForSessions(
+    sessions.map((row) => row.id),
+    { privateOnly: true }
+  );
+  const capabilities = (row: ListSessionInboxResult["items"][number]["rootSession"]) =>
+    effectiveSessionCapabilities(
+      viewer,
+      {
+        id: row.id,
+        ownerUserId: row.userId,
+        ownerTeamId: row.ownerTeamId,
+        visibility: row.visibility,
+        collaboratorIds: collaborators.get(row.id) ?? [],
+      },
+      mode
+    );
+  return sessionInboxPageSchema.parse({
+    items: result.items.map((item) => ({
+      rootSession: { ...item.rootSession, capabilities: capabilities(item.rootSession) },
+      descendantSessions: item.descendantSessions.map((row) => ({
+        ...row,
+        capabilities: capabilities(row),
+      })),
+    })),
     hasMore: result.hasMore,
     nextCursor: result.nextCursor ? encodeSessionInboxCursor(result.nextCursor) : null,
-  };
+  });
 }
 
 export async function handlePatchReadState(
@@ -238,6 +419,40 @@ export async function handlePatchReadState(
   return response;
 }
 
+export async function handleMarkSessionInboxRead(
+  request: Request,
+  env: Env,
+  _params: object,
+  ctx: UserRouteContext
+): Promise<Response> {
+  const body = await parseBody(
+    request,
+    sessionInboxMarkReadRequestSchema,
+    "Invalid session inbox read request"
+  );
+  if (body instanceof Response) return body;
+  const filterOptions = await resolveInboxFilterOptions(env, ctx, body);
+  if (filterOptions instanceof Response) return filterOptions;
+
+  const markedCount = await readSessionList(() =>
+    new SessionIndexStore(ctx.db).markInboxRead(filterOptions, body.rootSessionId)
+  );
+  if (markedCount instanceof Response) return markedCount;
+
+  const response = json(sessionInboxMarkReadResponseSchema.parse({ markedCount }));
+  response.headers.set("Cache-Control", "private, no-store");
+  log.info("session_inbox.marked_read", {
+    event: "session_inbox.marked_read",
+    marked_count: markedCount,
+    mine: body.mine === true,
+    team_count: body.teamIds?.length ?? 0,
+    root_session_id: body.rootSessionId ?? null,
+    request_id: ctx.request_id,
+    trace_id: ctx.trace_id,
+  });
+  return response;
+}
+
 export async function handleDeleteSession(
   _request: Request,
   env: Env,
@@ -256,7 +471,11 @@ export const sessionIndexRoutes = new Hono<ControlPlaneHonoEnv>();
 
 sessionIndexRoutes.get(
   "/sessions",
-  admit({ ...GITHUB_USER_OR_SERVICE_ROUTE, authorization: requirePermission("sessions.read") }),
+  admit({
+    ...GITHUB_USER_OR_SERVICE_ROUTE,
+    authorization: requirePermission("sessions.read"),
+    personalAccessTokens: "accept",
+  }),
   (c) => dispatch(c, handleListSessions)
 );
 sessionIndexRoutes.get(
@@ -267,13 +486,21 @@ sessionIndexRoutes.get(
   }),
   (c) => dispatch(c, handleListSessionInbox)
 );
+sessionIndexRoutes.post(
+  "/sessions/inbox/read-state",
+  admit({
+    ...SCM_AGNOSTIC_HUMAN_USER_ROUTE,
+    authorization: requirePermission("sessions.read", { service: "deny" }),
+  }),
+  (c) => dispatch(c, handleMarkSessionInboxRead)
+);
 sessionIndexRoutes.patch(
   "/sessions/:id/read-state",
-  admit({ ...SCM_AGNOSTIC_HUMAN_USER_ROUTE, authorization: requirePermission("sessions.read") }),
+  admit({ ...SCM_AGNOSTIC_HUMAN_USER_ROUTE, authorization: requireSession("read") }),
   (c) => dispatch(c, handlePatchReadState)
 );
 sessionIndexRoutes.delete(
   "/sessions/:id",
-  admit({ ...GITHUB_USER_OR_SERVICE_ROUTE, authorization: requirePermission("sessions.delete") }),
+  admit({ ...GITHUB_USER_OR_SERVICE_ROUTE, authorization: requireSession("delete") }),
   (c) => dispatch(c, handleDeleteSession)
 );

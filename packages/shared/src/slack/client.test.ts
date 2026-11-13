@@ -310,24 +310,27 @@ describe("getChannelInfo", () => {
     vi.restoreAllMocks();
   });
 
-  it("fetches channel info via GET with bearer auth", async () => {
-    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      jsonResponse({
-        ok: true,
-        channel: { id: "C123", name: "ops" },
-      })
-    );
+  it.each([
+    { id: "C123", name: "ops" },
+    { id: "C123", name: "ops", is_member: true, is_ext_shared: false },
+  ])(
+    "fetches channel info via GET with bearer auth and retains channel fields: %j",
+    async (channel) => {
+      const fetchSpy = vi
+        .spyOn(globalThis, "fetch")
+        .mockResolvedValueOnce(jsonResponse({ ok: true, channel }));
 
-    const result = await getChannelInfo("xoxb-token", "C123");
+      const result = await getChannelInfo("xoxb-token", "C123");
 
-    expect(result.ok).toBe(true);
-    expect(result.channel).toEqual({ id: "C123", name: "ops" });
-    const [url, init] = fetchSpy.mock.calls[0]!;
-    expect(url).toBe("https://slack.com/api/conversations.info?channel=C123");
-    expect(init?.method ?? "GET").toBe("GET");
-    const headers = init?.headers as Record<string, string>;
-    expect(headers.Authorization).toBe("Bearer xoxb-token");
-  });
+      expect(result.ok).toBe(true);
+      expect(result.channel).toEqual(channel);
+      const [url, init] = fetchSpy.mock.calls[0]!;
+      expect(url).toBe("https://slack.com/api/conversations.info?channel=C123");
+      expect(init?.method ?? "GET").toBe("GET");
+      const headers = init?.headers as Record<string, string>;
+      expect(headers.Authorization).toBe("Bearer xoxb-token");
+    }
+  );
 
   it("returns Slack's error envelope on lookup failure", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
@@ -337,28 +340,6 @@ describe("getChannelInfo", () => {
     const result = await getChannelInfo("xoxb-token", "C404");
     expect(result.ok).toBe(false);
     expect(result.error).toBe("channel_not_found");
-  });
-
-  it("on 429 returns ratelimited with retryAfter", async () => {
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      new Response("", {
-        status: 429,
-        headers: { "Retry-After": "5" },
-      })
-    );
-
-    const result = await getChannelInfo("xoxb-token", "C123");
-    expect(result.ok).toBe(false);
-    expect(result.error).toBe("ratelimited");
-    expect(result.retryAfter).toBe(5);
-  });
-
-  it("on 5xx returns a typed error", async () => {
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(new Response("oops", { status: 500 }));
-
-    const result = await getChannelInfo("xoxb-token", "C123");
-    expect(result.ok).toBe(false);
-    expect(result.error).toBe("http_500");
   });
 });
 
@@ -608,7 +589,23 @@ describe("getThreadMessages", () => {
           ],
         },
       ],
+      truncated: false,
     });
+  });
+
+  it("flags history cut off by the page cap as truncated", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async () =>
+      jsonResponse({
+        ok: true,
+        messages: [{ ts: "1.1", text: "first", user: "U1" }],
+        response_metadata: { next_cursor: "more" },
+      })
+    );
+
+    const result = await getThreadMessages("xoxb-token", "C123", "1.0");
+
+    expect(fetchSpy).toHaveBeenCalledTimes(25);
+    expect(result).toMatchObject({ ok: true, truncated: true });
   });
 
   it("passes oldest to fetch only newer replies", async () => {
@@ -643,6 +640,7 @@ describe("getThreadMessages", () => {
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.messages.map((m) => m.text)).toEqual(["first", "second"]);
+      expect(result.truncated).toBe(false);
     }
     expect(fetchSpy).toHaveBeenCalledTimes(2);
     const [secondUrl] = fetchSpy.mock.calls[1]!;

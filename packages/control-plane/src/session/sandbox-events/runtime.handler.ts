@@ -10,6 +10,7 @@ import type { SandboxRuntimeFacts } from "../sandbox-ports";
 import type { SessionCoreRepository } from "../session-core-repository";
 import type { SessionTitleUpdateOptions, SessionTitleUpdateResult } from "../title";
 import { persistSandboxEvent, type SandboxEventContext } from "./context";
+import { sandboxBootPhaseLogFields } from "../../sandbox/boot-phase";
 
 /**
  * Sandbox-runtime family: events about the sandbox itself rather than the
@@ -40,7 +41,12 @@ export class SandboxRuntimeEventHandler {
     private readonly backgroundTasks: BackgroundTasks,
     private readonly messageQueue: Pick<SessionMessageQueue, "processMessageQueue">,
     private readonly log: Logger,
-    private readonly lifecycle: SandboxReadiness
+    private readonly lifecycle: SandboxReadiness,
+    private readonly recordManagedMcpVersion: (
+      version: number,
+      bridgeInstanceId?: string,
+      runtimeVersion?: string
+    ) => void = () => {}
   ) {}
 
   handleHeartbeat(context: SandboxEventContext): void {
@@ -83,6 +89,14 @@ export class SandboxRuntimeEventHandler {
     persistSandboxEvent(this.eventRepository, event, context);
     this.messenger.broadcast({ type: "sandbox_event", event });
 
+    // An already-ready allocation still reports ready on bridge reconnect.
+    // Observe uncertainty before the lifecycle's duplicate-ready no-op guard;
+    // the current authenticated socket is not proof of native client teardown.
+    this.recordManagedMcpVersion(
+      event.managedMcpVersion ?? 0,
+      event.bridgeInstanceId,
+      event.runtimeVersion
+    );
     // No await between the authorized event and the lifecycle-owned commit.
     // Repeated, fenced or retired readiness must not wake the prompt queue.
     if (
@@ -117,13 +131,8 @@ export class SandboxRuntimeEventHandler {
     }
     this.log.info("sandbox.boot_progress", {
       event: "sandbox.boot_progress",
-      boot_seq: event.bootSeq,
-      phase: event.phase,
-      phase_status: event.status,
-      repo_owner: event.repoOwner ?? null,
-      repo_name: event.repoName ?? null,
-      elapsed_ms: event.elapsedMs ?? null,
-      warning: event.warning ?? false,
+      sandbox_id: event.sandboxId,
+      ...sandboxBootPhaseLogFields(toSandboxBootPhase(event)),
     });
     persistSandboxEvent(this.eventRepository, event, context);
     this.messenger.broadcast({ type: "sandbox_event", event });

@@ -13,7 +13,7 @@ subscriptions), see [CLAUDE_AGENT.md](CLAUDE_AGENT.md) and
 
 ## Install
 
-OpenCode needs Node `>=22.13.0`, the same floor as the repo (`package.json` `engines`).
+Use Node `>=24.0.0`, the same floor as the repo (`package.json` `engines`).
 
 ```bash
 npm install -g opencode-ai            # or: curl -fsSL https://opencode.ai/install | bash
@@ -31,7 +31,7 @@ The sandbox image pins its OpenCode version in
 Match the pinned version when you are debugging harness behaviour rather than writing ordinary code:
 
 ```bash
-opencode upgrade 1.18.29        # use the value from toolchain.json
+opencode upgrade <version>        # use the "opencode" value from toolchain.json
 ```
 
 ## First run

@@ -8,11 +8,26 @@ import { SettingsViewportProvider } from "@/components/settings/settings-viewpor
 import { SettingsNav } from "@/components/settings/settings-nav";
 import { resolveSettingsCategory } from "@/components/settings/settings-registry";
 import { useCurrentUserAuthorization } from "@/hooks/use-current-user-authorization";
+import { useMeTeams } from "@/hooks/use-teams";
+import { ErrorBanner } from "@/components/ui/error-banner";
+import {
+  SettingsNavigationGuardProvider,
+  useConfirmSettingsNavigation,
+} from "./settings-navigation-guard";
 
 /**
  * Hosts responsive settings content and redirects routes whose category is unavailable to the current user.
  */
 export function SettingsShell({ children }: { children: React.ReactNode }) {
+  return (
+    <SettingsNavigationGuardProvider>
+      <SettingsShellContent>{children}</SettingsShellContent>
+    </SettingsNavigationGuardProvider>
+  );
+}
+
+function SettingsShellContent({ children }: { children: React.ReactNode }) {
+  const confirmNavigation = useConfirmSettingsNavigation();
   const router = useRouter();
   const pathname = usePathname();
   const searchParams = useSearchParams();
@@ -20,22 +35,59 @@ export function SettingsShell({ children }: { children: React.ReactNode }) {
   const isHydrated = isMobile !== undefined;
   const tab = searchParams.get("tab");
   const { hasPermission, loading } = useCurrentUserAuthorization();
-  const requestedCategory = pathname.startsWith("/settings/integrations/") ? "integrations" : tab;
+  const { teams, loading: teamsLoading, error: teamsError } = useMeTeams();
+  const canEditTeam = teams.some((team) => team.capabilities?.canEditMetadata === true);
+  const requestedCategory = pathname.startsWith("/settings/integrations/")
+    ? "integrations"
+    : pathname.startsWith("/settings/teams/")
+      ? "teams"
+      : tab;
   const activeCategory = resolveSettingsCategory(
     requestedCategory,
     supportsRepoImages(),
-    hasPermission
+    hasPermission,
+    canEditTeam
   );
   const categoryRedirectRequired =
     requestedCategory !== null && activeCategory !== requestedCategory;
+  const teamLookupFailed =
+    requestedCategory === "teams" && !!teamsError && !hasPermission("workspace.members.manage");
 
   useEffect(() => {
-    if (isHydrated && !loading && categoryRedirectRequired) {
+    if (
+      isHydrated &&
+      !loading &&
+      !(requestedCategory === "teams" && teamsLoading) &&
+      !teamLookupFailed &&
+      categoryRedirectRequired
+    ) {
       router.replace(`/settings?tab=${activeCategory}`);
     }
-  }, [activeCategory, categoryRedirectRequired, isHydrated, loading, router]);
+  }, [
+    activeCategory,
+    categoryRedirectRequired,
+    isHydrated,
+    loading,
+    requestedCategory,
+    teamLookupFailed,
+    teamsLoading,
+    router,
+  ]);
 
-  if (!isHydrated || loading || categoryRedirectRequired) {
+  if (teamLookupFailed) {
+    return (
+      <main className="h-dvh bg-background p-6">
+        <ErrorBanner>Failed to load teams.</ErrorBanner>
+      </main>
+    );
+  }
+
+  if (
+    !isHydrated ||
+    loading ||
+    (requestedCategory === "teams" && teamsLoading) ||
+    categoryRedirectRequired
+  ) {
     return <main className="h-dvh overflow-hidden bg-background" aria-busy="true" />;
   }
 
@@ -52,7 +104,10 @@ export function SettingsShell({ children }: { children: React.ReactNode }) {
       <div className="flex h-dvh overflow-hidden bg-background">
         <SettingsNav
           activeCategory={activeCategory}
-          onSelect={(category) => router.push(`/settings?tab=${category}`)}
+          onSelect={(category) => {
+            if (category !== activeCategory && !confirmNavigation()) return;
+            router.push(`/settings?tab=${category}`);
+          }}
         />
         <main className="min-w-0 flex-1 overflow-y-auto px-8 py-10 lg:px-12">
           <div className="mx-auto max-w-3xl">{children}</div>

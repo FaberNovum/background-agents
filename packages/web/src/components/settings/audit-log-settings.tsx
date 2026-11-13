@@ -1,31 +1,137 @@
 "use client";
 
-import { useEffect, useRef } from "react";
-import type { AuditEvent, AuditOperationResult } from "@open-inspect/shared/types/audit-events";
+import { useEffect, useRef, useState } from "react";
+import {
+  AUTHORIZATION_DECISION_ACTIONS,
+  interpretAuditEvent,
+  type AuditEvent,
+  type AuditEventInterpretation,
+  type AuditObservationAction,
+  type AuditOperationAction,
+  type AuditOperationResult,
+} from "@open-inspect/shared/types/audit-events";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import {
+  Select,
+  SelectTrigger,
+  SelectValue,
+  SelectContent,
+  SelectItem,
+} from "@/components/ui/select";
 import { useAuditEvents } from "@/hooks/use-audit-events";
+import { useTeams } from "@/hooks/use-teams";
+import { useCurrentUserAuthorization } from "@/hooks/use-current-user-authorization";
+import { formatHttpStatus } from "@/lib/http-status";
 import { formatRelativeTime } from "@/lib/time";
 
-const OUTCOMES: Record<AuditOperationResult, { label: string; className: string }> = {
+interface BadgeTreatment {
+  label: string;
+  className: string;
+}
+
+const ALL_TEAMS_VALUE = "all-teams";
+
+const OPERATION_OUTCOMES: Record<AuditOperationResult, BadgeTreatment> = {
   applied: { label: "Applied", className: "bg-success-muted text-success" },
   no_op: { label: "No change", className: "bg-muted text-muted-foreground" },
   denied: { label: "Denied", className: "bg-destructive-muted text-destructive" },
   rejected: { label: "Rejected", className: "bg-warning-muted text-warning" },
 };
 
-const ACTION_LABELS: Record<string, string> = {
-  "authorization.request_allowed": "Request authorized",
-  "authorization.request_denied": "Request denied",
-  "workspace.member_role_updated": "Member role updated",
-  "workspace.member_status_updated": "Member status updated",
+// An allowed decision is informational: admission does not prove the operation succeeded.
+const AUTHORIZATION_DECISIONS: Record<"allowed" | "denied", BadgeTreatment> = {
+  allowed: { label: "Allowed", className: "bg-info-muted text-info" },
+  denied: { label: "Denied", className: "bg-destructive-muted text-destructive" },
 };
 
+const OBSERVATIONS: Record<"would_deny", BadgeTreatment> = {
+  would_deny: { label: "Would deny", className: "bg-info-muted text-info" },
+};
+
+// The client cannot say what an unrecognized action's stored result means.
+const UNRECOGNIZED: BadgeTreatment = {
+  label: "Unrecognized",
+  className: "bg-muted text-muted-foreground",
+};
+
+const OPERATION_LABELS: Record<AuditOperationAction, string> = {
+  "memory.created": "Memory created",
+  "memory.revised": "Memory revised",
+  "memory.archived": "Memory archived",
+  "memory.restored": "Memory restored",
+  "memory.approved": "Memory approved",
+  "memory.rejected": "Memory rejected",
+  "memory.superseded": "Memory superseded",
+  "memory.personal_read": "Personal memory read by an agent",
+  "session.private_break_glass": "Private session break-glass read",
+  "session.visibility_changed": "Session visibility changed",
+  "session.moved": "Session moved",
+  "session.collaborator_added": "Session collaborator added",
+  "session.collaborator_removed": "Session collaborator removed",
+  "session.created_private": "Private session created",
+  "workspace.member_role_updated": "Member role updated",
+  "workspace.member_status_updated": "Member status updated",
+  "workspace.default_role_assigned": "Default role assigned",
+  "workspace.owner_bootstrapped": "Owner bootstrapped",
+  "workspace.user_merged": "Users merged",
+  "workspace.admission_policy_updated": "Sign-in allowlist updated",
+  "workspace.admission_policy_maintenance": "Sign-in allowlist maintenance",
+  "team.created": "Team created",
+  "team.updated": "Team updated",
+  "team.archived": "Team archived",
+  "team.restored": "Team restored",
+  "team.member_added": "Team member added",
+  "team.member_role_changed": "Team member role changed",
+  "team.member_removed": "Team member removed",
+  "team.member_joined": "Team member joined",
+  "team.grant_added": "Team repository grant added",
+  "team.grant_removed": "Team repository grant removed",
+  "team.secret_set": "Team secret set",
+  "team.secret_deleted": "Team secret deleted",
+  "team.binding_added": "Team channel binding added",
+  "team.binding_removed": "Team channel binding removed",
+  "automation.executor_changed": "Automation executor changed",
+  "personal_access_token.created": "Personal access token created",
+  "personal_access_token.revoked": "Personal access token revoked",
+  "workspace.personal_access_token_policy_updated": "Access token policy updated",
+};
+
+const OBSERVATION_LABELS: Record<AuditObservationAction, string> = {
+  "session.shadow_denied": "Session read shadow observation",
+};
+
+const ACTION_LABELS = new Map<string, string>([
+  [AUTHORIZATION_DECISION_ACTIONS.allowed, "Authorization allowed"],
+  [AUTHORIZATION_DECISION_ACTIONS.denied, "Authorization denied"],
+  ...Object.entries(OBSERVATION_LABELS),
+  ...Object.entries(OPERATION_LABELS),
+]);
+
 function auditActionLabel(action: string): string {
-  return ACTION_LABELS[action] ?? action;
+  return ACTION_LABELS.get(action) ?? action;
+}
+
+function badgeTreatment(interpretation: AuditEventInterpretation): BadgeTreatment {
+  switch (interpretation.kind) {
+    case "authorization_decision":
+      return AUTHORIZATION_DECISIONS[interpretation.decision];
+    case "observation":
+      return OBSERVATIONS[interpretation.observation];
+    case "operation":
+      return OPERATION_OUTCOMES[interpretation.result];
+    case "unknown":
+      return UNRECOGNIZED;
+  }
 }
 
 function actorSummary(event: AuditEvent): string {
+  if (event.principalKind === "personal-access-token") {
+    const tokenId = event.metadata.personalAccessTokenId;
+    const token = typeof tokenId === "string" ? `Personal access token / ${tokenId}` : null;
+    const owner = event.actorUserIdSnapshot ? `User / ${event.actorUserIdSnapshot}` : null;
+    return [token ?? "Personal access token", owner].filter(Boolean).join(" / ");
+  }
   if (event.actorServiceSnapshot && event.actorUserIdSnapshot) {
     return `Service / ${event.actorServiceSnapshot} / User actor / ${event.actorUserIdSnapshot}`;
   }
@@ -43,8 +149,9 @@ function resourceSummary(event: AuditEvent): string {
     : resource;
 }
 
-function AuditEventCard({ event }: { event: AuditEvent }) {
-  const outcome = OUTCOMES[event.operationResult];
+export function AuditEventCard({ event }: { event: AuditEvent }) {
+  const interpretation = interpretAuditEvent(event);
+  const badge = badgeTreatment(interpretation);
   const localTimestamp = new Date(event.occurredAt).toLocaleString();
 
   return (
@@ -63,7 +170,7 @@ function AuditEventCard({ event }: { event: AuditEvent }) {
               {localTimestamp} / {formatRelativeTime(event.occurredAt)}
             </time>
           </div>
-          <Badge className={`w-fit shrink-0 ${outcome.className}`}>{outcome.label}</Badge>
+          <Badge className={`w-fit shrink-0 ${badge.className}`}>{badge.label}</Badge>
         </div>
 
         <dl className="mt-3 grid min-w-0 gap-x-5 gap-y-2 text-xs sm:grid-cols-2">
@@ -83,6 +190,16 @@ function AuditEventCard({ event }: { event: AuditEvent }) {
             <dt className="text-muted-foreground">Reason</dt>
             <dd className="break-words font-mono text-foreground">{event.reasonCode}</dd>
           </div>
+          {interpretation.kind === "authorization_decision" && (
+            <div className="min-w-0">
+              <dt className="text-muted-foreground">HTTP response</dt>
+              <dd className="break-words font-mono text-foreground">
+                {interpretation.httpStatus === null
+                  ? "Not recorded"
+                  : formatHttpStatus(interpretation.httpStatus)}
+              </dd>
+            </div>
+          )}
         </dl>
 
         <details className="mt-3 text-xs">
@@ -95,6 +212,7 @@ function AuditEventCard({ event }: { event: AuditEvent }) {
                 eventId: event.id,
                 action: event.action,
                 principalKind: event.principalKind,
+                operationResult: event.operationResult,
                 metadata: event.metadata,
               },
               null,
@@ -107,9 +225,50 @@ function AuditEventCard({ event }: { event: AuditEvent }) {
   );
 }
 
+const SKELETON_EVENT_COUNT = 3;
+const SKELETON_FIELD_COUNT = 4;
+
+/** Mirrors AuditEventCard: heading and timestamp beside a badge, then the field grid. */
+function AuditEventsSkeleton() {
+  return (
+    // role="status" is an implicit polite live region, so the sr-only text is announced.
+    <div
+      role="status"
+      aria-label="Loading audit events"
+      className="min-w-0 divide-y divide-border-muted rounded-md border border-border-muted animate-pulse motion-reduce:animate-none"
+    >
+      <span className="sr-only">Loading audit events...</span>
+      {Array.from({ length: SKELETON_EVENT_COUNT }, (_, index) => (
+        <div key={index} className="px-4 py-4 sm:px-5">
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+            <div className="min-w-0">
+              <div className="my-0.5 h-4 w-48 max-w-full rounded bg-muted" />
+              <div className="mt-1.5 mb-0.5 h-3 w-64 max-w-full rounded bg-muted" />
+            </div>
+            <div className="h-5 w-16 shrink-0 rounded-sm bg-muted" />
+          </div>
+          <div className="mt-3 grid gap-x-5 gap-y-2 sm:grid-cols-2">
+            {Array.from({ length: SKELETON_FIELD_COUNT }, (_, field) => (
+              <div key={field}>
+                <div className="my-0.5 h-3 w-14 rounded bg-muted" />
+                <div className="mt-1 mb-0.5 h-3 w-40 max-w-full rounded bg-muted" />
+              </div>
+            ))}
+          </div>
+          <div className="mt-3.5 mb-0.5 h-3 w-28 rounded bg-muted" />
+        </div>
+      ))}
+    </div>
+  );
+}
+
 /** Read-only, cursor-paginated view of durable workspace audit events. */
 export function AuditLogSettings() {
-  const audit = useAuditEvents();
+  const { hasPermission } = useCurrentUserAuthorization();
+  const canReadAudit = hasPermission("workspace.audit.read");
+  const { teams, loading: teamsLoading, error: teamsError } = useTeams(canReadAudit);
+  const [teamId, setTeamId] = useState("");
+  const audit = useAuditEvents({ teamId: teamId || undefined, enabled: canReadAudit });
   const headingRef = useRef<HTMLHeadingElement>(null);
   const focusAfterPaginationRef = useRef(false);
 
@@ -125,6 +284,12 @@ export function AuditLogSettings() {
     navigate();
   };
 
+  if (!canReadAudit) {
+    return (
+      <p className="text-sm text-muted-foreground">You do not have access to the audit log.</p>
+    );
+  }
+
   return (
     <section aria-labelledby="audit-log-heading">
       <h2
@@ -135,9 +300,45 @@ export function AuditLogSettings() {
       >
         Audit log
       </h2>
-      <p className="mb-6 text-sm text-muted-foreground">
-        Review workspace operations and authorization decisions. Events are shown newest first.
+      <p className="mb-2 text-sm text-muted-foreground">
+        Review workspace operations, authorization decisions, and observations. Events are shown
+        newest first.
       </p>
+      <p className="mb-6 text-sm text-muted-foreground">
+        Authorization decisions record whether a request was allowed or denied and the HTTP response
+        it returned. They do not confirm that the requested change took effect. Applied, No change,
+        and Rejected are recorded only by the operation that made or refused the change. Shadow
+        observations marked Would deny describe hypothetical denials, not enforced denials or
+        operation outcomes.
+      </p>
+
+      <div className="mb-6 flex flex-wrap items-center gap-3">
+        <label htmlFor="audit-team-filter" className="text-sm font-medium">
+          Team
+        </label>
+        <Select
+          value={teamId || ALL_TEAMS_VALUE}
+          onValueChange={(value) => setTeamId(value === ALL_TEAMS_VALUE ? "" : value)}
+          disabled={teamsLoading || !!teamsError}
+        >
+          <SelectTrigger id="audit-team-filter" className="w-auto min-w-48 max-w-full">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value={ALL_TEAMS_VALUE}>All teams</SelectItem>
+            {teams.map((team) => (
+              <SelectItem key={team.id} value={team.id}>
+                {team.name}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        {teamsError && (
+          <p role="status" className="text-xs text-destructive">
+            Unable to load team filters.
+          </p>
+        )}
+      </div>
 
       {audit.error && audit.events.length > 0 && (
         <div
@@ -154,13 +355,7 @@ export function AuditLogSettings() {
       )}
 
       {audit.loading ? (
-        <div className="rounded-md border border-border-muted py-12 text-center" aria-live="polite">
-          <div
-            className="mx-auto size-6 animate-spin rounded-full border-2 border-current border-t-transparent text-muted-foreground"
-            aria-hidden="true"
-          />
-          <p className="mt-3 text-sm text-muted-foreground">Loading audit events...</p>
-        </div>
+        <AuditEventsSkeleton />
       ) : audit.error && audit.events.length === 0 ? (
         <div role="alert" className="rounded-md border border-destructive-border p-5">
           <p className="text-sm font-medium text-destructive">Unable to load the audit log.</p>

@@ -4,6 +4,14 @@
 
 import { admit } from "../routing/admit";
 import {
+  automationCapabilities,
+  type AutomationCapabilities,
+  type AutomationView,
+  type SessionViewer,
+} from "@open-inspect/shared";
+import type { AutomationRow } from "../db/automation-store";
+import { hydrateAutomation } from "../automation/hydrate";
+import {
   type RequestContext,
   GITHUB_USER_OR_SERVICE_ROUTE,
   requireAutomation,
@@ -16,9 +24,54 @@ export function admittedAutomation(ctx: RequestContext): AutomationRouteAdmissio
   return ctx.automationAdmission;
 }
 
-export const AUTOMATIONS_READ = admit({
+/** What `viewer` may do with the automation stored in `row`. */
+export function automationResponseCapabilities(
+  viewer: SessionViewer,
+  row: AutomationRow
+): AutomationCapabilities {
+  return automationCapabilities(viewer, {
+    ownerTeamId: row.owner_team_id,
+    executorUserId: row.user_id,
+  });
+}
+
+/** The automation response for one viewer. */
+export async function hydrateAutomationResponse(
+  ctx: RequestContext,
+  row: AutomationRow,
+  viewer: SessionViewer
+): Promise<AutomationView> {
+  return {
+    ...(await hydrateAutomation(ctx.db, row)),
+    capabilities: automationResponseCapabilities(viewer, row),
+  };
+}
+
+/** Admission for routes gated only on the `automations.read` permission, not one automation. */
+export const AUTOMATIONS_READ_PERMISSION = admit({
   ...GITHUB_USER_OR_SERVICE_ROUTE,
-  authorization: requirePermission("automations.read"),
+  authorization: requirePermission("automations.read", {
+    actorlessGrants: [{ service: "slack-bot" }],
+  }),
+});
+
+/**
+ * Listing automations, which a personal access token granted `automations.read` may also do. Kept
+ * apart from AUTOMATIONS_READ_PERMISSION so other routes on that permission stay closed to tokens.
+ */
+export const AUTOMATIONS_LIST = admit({
+  ...AUTOMATIONS_READ_PERMISSION.policy,
+  personalAccessTokens: "accept",
+});
+
+/**
+ * Admission for routes that read one automation: hidden automations answer 404. Every route on it
+ * is a read, so a personal access token granted `automations.read` may use them.
+ */
+export const AUTOMATION_READ = admit({
+  ...GITHUB_USER_OR_SERVICE_ROUTE,
+  authorization: requireAutomation("read"),
+  personalAccessTokens: "accept",
 });
 
 /** Admission for routes that change one automation; extend it for per-route response policy. */

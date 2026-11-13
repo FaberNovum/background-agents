@@ -9,12 +9,9 @@ import { MODEL_PREFERENCES_UNAVAILABLE_MESSAGE } from "../app-home/models";
 import { collectForwardedMessages } from "../forwarded-messages";
 import { fetchInteractiveThreadContext } from "../interactive-thread-context";
 import { createLogger } from "../logger";
-import {
-  buildWorkingMessage,
-  formatSessionDefaultsNotice,
-  scheduleStartingStatus,
-  type BackgroundTaskScheduler,
-} from "../messages/blocks";
+import { resolveChannelBinding } from "../channel-bindings";
+import { lookupThreadSession, THREAD_CLOSED_MESSAGE } from "../sessions/thread-session-store";
+import { buildWorkingMessage, scheduleStartingStatus } from "../messages/blocks";
 import { formatAttributedRequest } from "../messages/context";
 import {
   deleteLegacyPendingRequest,
@@ -23,15 +20,17 @@ import {
   getPendingRequest,
 } from "../pending-requests/pending-request-store";
 import {
+  announceLaunchedSession,
   loadAuthoritativeSlackLaunchSettings,
   startSessionAndSendPrompt,
   type SlackLaunchSettings,
 } from "../sessions/session-launcher";
 import { resolveTargetValue, targetSelectedText } from "../target-clarification";
 import { targetId, type SlackSessionTarget } from "../targets";
-import type { Env } from "../types";
+import type { BackgroundTaskScheduler, Env } from "../types";
 import { resolveSlackActorIdentity } from "../user-identity";
-import { hasInlinePromptOptions, resolveInlinePromptOptions } from "../inline-flags";
+import { hasInlinePromptOptions } from "@open-inspect/shared/inline-prompt-flags";
+import { resolveInlinePromptOptions } from "../inline-flags";
 
 const log = createLogger("target-selection");
 
@@ -140,6 +139,24 @@ export async function handleTargetSelection(
     );
     return;
   }
+  if ((await lookupThreadSession(env, channel, threadKey))?.closed) {
+    await postMessage(env.SLACK_BOT_TOKEN, channel, THREAD_CLOSED_MESSAGE, {
+      thread_ts: threadKey,
+    });
+    return;
+  }
+  const binding = await resolveChannelBinding(env, channel, threadKey, traceId);
+  if (!binding) return;
+  if (pendingData.teamId !== undefined && pendingData.teamId !== binding.teamId) {
+    await postMessage(
+      env.SLACK_BOT_TOKEN,
+      channel,
+      "This channel's binding has changed. Please start a new request.",
+      { thread_ts: threadKey }
+    );
+    return;
+  }
+  const teamId = pendingData.teamId === undefined ? binding.teamId : pendingData.teamId;
   const legacyInlinePromptOptions =
     !requestId && "inlinePromptOptions" in pendingData
       ? pendingData.inlinePromptOptions
@@ -179,7 +196,7 @@ export async function handleTargetSelection(
     }
     resolvedLaunchPlan = { sessionDefaults: resolvedTurn.turnPlan.effective };
   }
-  const target = await resolveTargetValue(env, selectedValue, traceId);
+  const target = await resolveTargetValue(env, selectedValue, traceId, channel, userId);
   if (!target) {
     await postMessage(
       env.SLACK_BOT_TOKEN,
@@ -265,6 +282,7 @@ export async function handleTargetSelection(
     : message;
   const sessionResult = await startSessionAndSendPrompt(env, {
     target,
+    teamId,
     channel,
     threadTs: threadKey,
     messageText,
@@ -297,14 +315,11 @@ export async function handleTargetSelection(
   }
   await retireTargetClarificationPrompt(env, channel, messageTs, target, traceId);
   if (ackTs) {
-    const launched = buildWorkingMessage({
-      sessionId: sessionResult.sessionId,
-      webAppUrl: env.WEB_APP_URL,
-      sessionDefaultsNotice: formatSessionDefaultsNotice(sessionResult),
-    });
-    await updateMessage(env.SLACK_BOT_TOKEN, channel, ackTs, launched.text, {
-      blocks: launched.blocks,
-    });
-    scheduleStartingStatus(scheduleBackground, env, channel, threadKey, traceId);
+    await announceLaunchedSession(
+      env,
+      { channel, threadTs: threadKey, ackTs, ownerUserId: userId, session: sessionResult },
+      scheduleBackground,
+      traceId
+    );
   }
 }

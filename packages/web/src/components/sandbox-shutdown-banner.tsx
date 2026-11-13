@@ -1,23 +1,25 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type {
   SandboxShutdownState,
   ShutdownRecoveryAction,
 } from "@open-inspect/shared/types/sandbox-shutdown";
 import { cn } from "@/lib/utils";
+import { sandboxPromptBlockReason } from "@open-inspect/shared/types/sandbox-shutdown";
 import type { ShutdownRecoveryResult } from "@/hooks/use-session-socket";
 
-const PHASE_MESSAGES: Record<Exclude<SandboxShutdownState["phase"], "running">, string> = {
-  draining: "Stopping the prompt to save your sandbox state.",
-  prepared: "Prompt stopped. Preparing final sandbox state.",
-  capturing: "Saving final sandbox state.",
-  retiring: "State saved. Confirming sandbox shutdown.",
+const PHASE_MESSAGES: Record<
+  Extract<SandboxShutdownState["phase"], "saved" | "failed" | "unknown">,
+  string
+> = {
   saved: "Sandbox saved and stopped.",
-  restoring: "Restoring the saved sandbox state.",
-  failed: "Final sandbox save failed. Changes since the last verified save may be missing.",
-  unknown: "Final sandbox save could not be confirmed. Changes may be missing.",
+  failed: "The sandbox could not be saved.",
+  unknown: "The sandbox save could not be confirmed.",
 };
+
+const DISCARD_CONFIRMATION =
+  "Discard this sandbox and start a new one from the repository? Its unsaved changes will be lost. Queued messages will run in the new sandbox.";
 
 interface SandboxShutdownBannerProps {
   shutdown: SandboxShutdownState | null | undefined;
@@ -25,18 +27,45 @@ interface SandboxShutdownBannerProps {
 }
 
 export function SandboxShutdownBanner({ shutdown, onRecover }: SandboxShutdownBannerProps) {
+  if (!shutdown) return null;
+  // Recovery state describes one phase; a new phase gets a fresh banner.
+  return <ShutdownPhaseBanner key={shutdown.phase} shutdown={shutdown} onRecover={onRecover} />;
+}
+
+function ShutdownPhaseBanner({
+  shutdown,
+  onRecover,
+}: SandboxShutdownBannerProps & { shutdown: SandboxShutdownState }) {
   const [pendingAction, setPendingAction] = useState<ShutdownRecoveryAction | null>(null);
   const [recoveryError, setRecoveryError] = useState<string | null>(null);
+  const [mounted, setMounted] = useState(false);
 
-  if (!shutdown || shutdown.phase === "running") return null;
+  useEffect(() => setMounted(true), []);
 
-  const isError = shutdown.phase === "failed" || shutdown.phase === "unknown";
-  const isContinuationPaused = shutdown.phase === "saved" && shutdown.continuationPaused === true;
+  const { phase } = shutdown;
+  const isError = phase === "failed" || phase === "unknown";
+  const isContinuationPaused = phase === "saved" && shutdown.continuationPaused === true;
+  // Routine stops, saves, and restores are reported by the header's sandbox status, which
+  // projects graceful-stop phases onto it. The banner is reserved for failures and for an
+  // interrupted sandbox that holds queued work.
+  if (!isError && !isContinuationPaused) return null;
+
   const recoveryActions = shutdown.availableRecoveryActions ?? [];
   const canRetry = recoveryActions.includes("retry");
   const canRestoreSaved = recoveryActions.includes("restore_saved");
+  const canDiscard = shutdown.discardAvailable === true;
   const canResumeQueuedWork = isContinuationPaused && canRestoreSaved;
-  const detail = shutdown.error ?? shutdown.reason;
+  const detail = isError ? (shutdown.error ?? shutdown.reason) : undefined;
+  const savedAt =
+    mounted && shutdown.hasRecoveryPoint && shutdown.savedAtMs != null
+      ? new Date(shutdown.savedAtMs).toLocaleString(undefined, {
+          dateStyle: "medium",
+          timeStyle: "long",
+        })
+      : null;
+  const lossWarning = shutdown.hasRecoveryPoint
+    ? "Changes since the last save may be lost."
+    : "Unsaved changes may be lost.";
 
   const recover = async (action: ShutdownRecoveryAction) => {
     if (!onRecover || pendingAction) return;
@@ -69,22 +98,27 @@ export function SandboxShutdownBanner({ shutdown, onRecover }: SandboxShutdownBa
           : "border-border-muted bg-muted text-foreground"
       )}
     >
-      <span className="font-medium">{PHASE_MESSAGES[shutdown.phase]}</span>
+      <span className="font-medium">{PHASE_MESSAGES[phase]}</span>
+      {savedAt && <span className="ml-2">Last saved: {savedAt}.</span>}
+      {isError && <span className="ml-2">{lossWarning}</span>}
       {isContinuationPaused && (
         <span className="ml-2">
-          The previous prompt was interrupted and will not replay automatically. Partial work was
-          saved. Queued work will wait until you resume.
+          The sandbox was interrupted. Partial state was saved. Queued work will wait until you
+          resume; interrupted prompts will not replay automatically.
         </span>
       )}
       {detail && <span className="ml-2">{detail}</span>}
-      {shutdown.phase === "failed" && canRetry && onRecover && (
+      {isError && recoveryActions.length === 0 && !canDiscard && (
+        <span className="ml-2">{sandboxPromptBlockReason(shutdown)}</span>
+      )}
+      {isError && canRetry && onRecover && (
         <button
           type="button"
           className="ml-3 underline disabled:cursor-not-allowed disabled:opacity-60"
           disabled={pendingAction !== null}
           onClick={() => void recover("retry")}
         >
-          {pendingAction === "retry" ? "Retrying shutdown…" : "Retry shutdown"}
+          {pendingAction === "retry" ? "Retrying save…" : "Retry save"}
         </button>
       )}
       {isError && canRestoreSaved && onRecover && (
@@ -95,7 +129,9 @@ export function SandboxShutdownBanner({ shutdown, onRecover }: SandboxShutdownBa
           onClick={() => {
             if (
               window.confirm(
-                "Restore the last saved sandbox state? Changes since that save may be lost."
+                savedAt
+                  ? `Restore the sandbox state saved on ${savedAt}? Changes since that save may be lost.`
+                  : "Restore the last saved sandbox state? Changes since that save may be lost."
               )
             ) {
               void recover("restore_saved");
@@ -103,6 +139,18 @@ export function SandboxShutdownBanner({ shutdown, onRecover }: SandboxShutdownBa
           }}
         >
           {pendingAction === "restore_saved" ? "Restoring saved state…" : "Restore saved state"}
+        </button>
+      )}
+      {isError && canDiscard && onRecover && (
+        <button
+          type="button"
+          className="ml-3 underline disabled:cursor-not-allowed disabled:opacity-60"
+          disabled={pendingAction !== null}
+          onClick={() => {
+            if (window.confirm(DISCARD_CONFIRMATION)) void recover("discard");
+          }}
+        >
+          {pendingAction === "discard" ? "Discarding sandbox…" : "Discard and start fresh"}
         </button>
       )}
       {canResumeQueuedWork && onRecover && (

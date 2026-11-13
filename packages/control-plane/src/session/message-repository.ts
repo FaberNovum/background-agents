@@ -6,15 +6,47 @@ import {
   type MessageStatus,
 } from "@open-inspect/shared/types/sessions";
 import { MAX_UNFINISHED_PROMPTS } from "@open-inspect/shared/types/prompts";
+import { z } from "zod";
 import type { CreateEventData, EventRepository } from "./event-repository";
 import type { SessionAttachmentRepository } from "./session-attachment-repository";
 import type { SqlResult, SqlStorage, TransactionSync } from "./sql-storage";
-import type { MessageRow } from "./types";
+import {
+  messageRowSchema,
+  sessionRowSchema,
+  SessionStorageIntegrityError,
+  type MessageRow,
+} from "./types";
 import type { MessageListCursor } from "./message-cursor";
 
 type ExecutionCompleteEvent = Extract<SandboxEvent, { type: "execution_complete" }>;
 
 export const STOP_CONFIRMATION_TIMEOUT_MS = 15_000;
+
+const messageIdRowSchema = messageRowSchema.pick({ id: true });
+const messageStopConfirmationRowSchema = messageRowSchema
+  .pick({ id: true, stop_confirmation_deadline: true })
+  .extend({ stop_confirmation_deadline: z.number() });
+const messageCreatedAtRowSchema = messageRowSchema.pick({ id: true, created_at: true });
+const messageReportedCostRowSchema = messageRowSchema.pick({ reported_cost_usd: true });
+const messageCallbackContextRowSchema = messageRowSchema.pick({
+  callback_context: true,
+  source: true,
+});
+const messageCancellationRowSchema = messageRowSchema.pick({
+  status: true,
+  source: true,
+  callback_context: true,
+});
+const messageCompletionStateRowSchema = z.object({
+  status: z.unknown().optional(),
+  created_at: z.number(),
+  started_at: z.number().nullable(),
+});
+const messageProcessingAuthorRowSchema = messageRowSchema.pick({ author_id: true, source: true });
+const messageProcessingAuthorAccountRowSchema = messageRowSchema.pick({
+  author_canonical_user_id: true,
+});
+const sessionBudgetExhaustedRowSchema = sessionRowSchema.pick({ budget_exhausted: true });
 
 export interface RecordedMessageCompletion {
   messageId: string;
@@ -43,8 +75,16 @@ function parseMessageStatus(value: unknown): MessageStatus | null {
 
 /** Data for creating a message. */
 export interface CreateMessageData {
+  admittedCanonicalUserId?: string | null;
+  mcpEligible?: boolean;
   id: string;
   authorId: string;
+  /**
+   * The author's account as it is when the prompt is queued. Personal memory decisions read this
+   * snapshot, so later identity links or merges never reclassify a prompt; without one, the prompt
+   * counts as someone else's.
+   */
+  authorCanonicalUserId?: string | null;
   content: string;
   source: MessageSource;
   model?: string | null;
@@ -94,10 +134,6 @@ export class MessageRepository {
     private readonly eventRepository: EventRepository
   ) {}
 
-  private rows<T>(result: SqlResult): T[] {
-    return result.toArray() as T[];
-  }
-
   getActiveDurationMs(): number {
     const result = this.sql.exec(
       `SELECT COALESCE(SUM(completed_at - started_at), 0) as duration_ms
@@ -121,7 +157,7 @@ export class MessageRepository {
 
   getProcessingMessage(): { id: string } | null {
     const result = this.sql.exec(`SELECT id FROM messages WHERE status = 'processing' LIMIT 1`);
-    const rows = result.toArray() as Array<{ id: string }>;
+    const rows = parseStorageRows(result.toArray(), messageIdRowSchema);
     return rows[0] ?? null;
   }
 
@@ -130,7 +166,7 @@ export class MessageRepository {
       `SELECT id, stop_confirmation_deadline FROM messages
        WHERE stop_confirmation_deadline IS NOT NULL LIMIT 1`
     );
-    const row = (result.toArray() as Array<{ id: string; stop_confirmation_deadline: number }>)[0];
+    const row = parseStorageRows(result.toArray(), messageStopConfirmationRowSchema)[0];
     return row ? { id: row.id, deadline: row.stop_confirmation_deadline } : null;
   }
 
@@ -153,9 +189,11 @@ export class MessageRepository {
     // would only expose the post-update value.
     const rows = this.sql
       .exec(`SELECT reported_cost_usd FROM messages WHERE id = ?`, messageId)
-      .toArray() as Array<{ reported_cost_usd: number }>;
+      .toArray();
     if (rows.length !== 1) return 0;
-    const previous = rows[0].reported_cost_usd;
+    const parsed = messageReportedCostRowSchema.safeParse(rows[0]);
+    if (!parsed.success) throw new SessionStorageIntegrityError("Malformed persisted message row");
+    const previous = parsed.data.reported_cost_usd;
     if (reportedCostUsd <= previous) return 0;
     this.sql.exec(
       `UPDATE messages SET reported_cost_usd = ? WHERE id = ?`,
@@ -173,7 +211,7 @@ export class MessageRepository {
     const result = this.sql.exec(
       `SELECT id, created_at FROM messages WHERE status = 'processing' LIMIT 1`
     );
-    const rows = result.toArray() as Array<{ id: string; created_at: number }>;
+    const rows = parseStorageRows(result.toArray(), messageCreatedAtRowSchema);
     return rows[0] ?? null;
   }
 
@@ -189,13 +227,13 @@ export class MessageRepository {
     const result = this.sql.exec(
       `SELECT * FROM messages WHERE status = 'pending' ORDER BY created_at ASC, rowid ASC LIMIT 1`
     );
-    const rows = this.rows<MessageRow>(result);
+    const rows = parseMessageRows(result.toArray());
     return rows[0] ?? null;
   }
 
   getMessageById(messageId: string): MessageRow | null {
     const result = this.sql.exec(`SELECT * FROM messages WHERE id = ? LIMIT 1`, messageId);
-    return this.rows<MessageRow>(result)[0] ?? null;
+    return parseMessageRows(result.toArray())[0] ?? null;
   }
 
   getMessageByClientRequestId(clientRequestId: string): MessageRow | null {
@@ -203,7 +241,7 @@ export class MessageRepository {
       `SELECT * FROM messages WHERE client_request_id = ? LIMIT 1`,
       clientRequestId
     );
-    return this.rows<MessageRow>(result)[0] ?? null;
+    return parseMessageRows(result.toArray())[0] ?? null;
   }
 
   getAutofixMessageId(feedbackKey: string): string | null {
@@ -230,10 +268,9 @@ export class MessageRepository {
       if (existingMessageId) {
         return { kind: "duplicate", messageId: existingMessageId };
       }
-      const budget = (
-        this.sql.exec(`SELECT budget_exhausted FROM session LIMIT 1`).toArray() as Array<{
-          budget_exhausted: number;
-        }>
+      const budget = parseStorageRows(
+        this.sql.exec(`SELECT budget_exhausted FROM session LIMIT 1`).toArray(),
+        sessionBudgetExhaustedRowSchema
       )[0];
       if (budget?.budget_exhausted === 1) {
         return { kind: "rejected", reason: "budget_exhausted" };
@@ -287,7 +324,7 @@ export class MessageRepository {
       `SELECT * FROM messages WHERE status IN ('pending', 'processing')
        ORDER BY CASE status WHEN 'processing' THEN 0 ELSE 1 END, created_at ASC, rowid ASC`
     );
-    return this.rows<MessageRow>(result);
+    return parseMessageRows(result.toArray());
   }
 
   listPromptQueue(): PromptQueueItem[] {
@@ -305,17 +342,12 @@ export class MessageRepository {
         `SELECT status, source, callback_context FROM messages WHERE id = ?`,
         messageId
       );
-      const message = (
-        result.toArray() as Array<{
-          status?: unknown;
-          source: string;
-          callback_context: string | null;
-        }>
-      )[0];
-      const status = parseMessageStatus(message?.status);
+      const rawMessage = result.toArray()[0];
+      const parsedMessage = messageCancellationRowSchema.safeParse(rawMessage);
+      if (!parsedMessage.success) return false;
+      const message = parsedMessage.data;
       if (
-        !message ||
-        status !== "pending" ||
+        message.status !== "pending" ||
         message.source !== "web" ||
         message.callback_context !== null
       ) {
@@ -339,22 +371,21 @@ export class MessageRepository {
       `SELECT callback_context, source FROM messages WHERE id = ?`,
       messageId
     );
-    const rows = result.toArray() as Array<{
-      callback_context: string | null;
-      source: string | null;
-    }>;
+    const rows = parseStorageRows(result.toArray(), messageCallbackContextRowSchema);
     return rows[0] ?? null;
   }
 
   createMessage(data: CreateMessageData): void {
     this.sql.exec(
       `INSERT INTO messages (
-         id, author_id, content, source, model, reasoning_effort, attachments,
-         callback_context, client_request_id, request_fingerprint, autofix_feedback_key,
-         autofix_pr_key, origin_context, status, created_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         id, author_id, author_canonical_user_id, content, source, model, reasoning_effort,
+         attachments, callback_context, client_request_id, request_fingerprint,
+         autofix_feedback_key, autofix_pr_key, origin_context, status, created_at,
+         admitted_canonical_user_id, mcp_eligible
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       data.id,
       data.authorId,
+      data.authorCanonicalUserId ?? null,
       data.content,
       data.source,
       data.model ?? null,
@@ -367,7 +398,9 @@ export class MessageRepository {
       data.autofixPrKey ?? null,
       data.originContext ?? null,
       data.status,
-      data.createdAt
+      data.createdAt,
+      data.admittedCanonicalUserId ?? null,
+      data.mcpEligible ? 1 : 0
     );
   }
 
@@ -391,7 +424,7 @@ export class MessageRepository {
   ): boolean {
     return this.transactionSync(() => {
       const claimed = this.sql.exec(
-        `UPDATE messages SET status = 'processing', started_at = ?
+        `UPDATE messages SET status = 'processing', started_at = ?, mcp_revision = mcp_revision + 1, mcp_context = NULL, mcp_closed = 0
          WHERE id = ? AND status = 'pending'
            AND NOT EXISTS (SELECT 1 FROM messages WHERE status = 'processing')
          RETURNING id`,
@@ -435,13 +468,7 @@ export class MessageRepository {
         `SELECT status, created_at, started_at FROM messages WHERE id = ?`,
         event.messageId
       );
-      const message = (
-        result.toArray() as Array<{
-          status?: unknown;
-          created_at: number;
-          started_at: number | null;
-        }>
-      )[0];
+      const message = parseStorageRows(result.toArray(), messageCompletionStateRowSchema)[0];
       const messageStatus = parseMessageStatus(message?.status);
       if (!message || messageStatus !== expectedStatus) return null;
 
@@ -495,7 +522,7 @@ export class MessageRepository {
     params.push(options.limit + 1);
 
     const result = this.sql.exec(query, ...params);
-    return this.rows<MessageRow>(result);
+    return parseMessageRows(result.toArray());
   }
 
   getLatestTerminalMessage(): MessageRow | null {
@@ -505,15 +532,69 @@ export class MessageRepository {
        ORDER BY COALESCE(completed_at, started_at, created_at) DESC, created_at DESC, id DESC
        LIMIT 1`
     );
-    const rows = this.rows<MessageRow>(result);
+    const rows = parseMessageRows(result.toArray());
     return rows[0] ?? null;
   }
 
-  getProcessingMessageAuthor(): { author_id: string } | null {
+  getProcessingMessageAuthority(): { canonicalUserId: string | null; mcpEligible: boolean } | null {
+    const row = this.sql
+      .exec(
+        "SELECT admitted_canonical_user_id, mcp_eligible FROM messages WHERE status = 'processing' LIMIT 1"
+      )
+      .toArray()[0] as
+      { admitted_canonical_user_id: string | null; mcp_eligible: number } | undefined;
+    return row
+      ? { canonicalUserId: row.admitted_canonical_user_id, mcpEligible: row.mcp_eligible === 1 }
+      : null;
+  }
+
+  getProcessingMessageAuthor(): { author_id: string; source: MessageSource } | null {
     const result = this.sql.exec(
-      `SELECT author_id FROM messages WHERE status = 'processing' LIMIT 1`
+      `SELECT author_id, source FROM messages WHERE status = 'processing' LIMIT 1`
     );
-    const rows = result.toArray() as Array<{ author_id: string }>;
+    const rows = parseStorageRows(result.toArray(), messageProcessingAuthorRowSchema);
     return rows[0] ?? null;
   }
+
+  /**
+   * The account the processing prompt was queued under: null when nothing is processing, for an
+   * Autofix turn, or for an author without an account.
+   */
+  getProcessingPromptAccount(): string | null {
+    const result = this.sql.exec(
+      `SELECT author_canonical_user_id FROM messages WHERE status = 'processing' LIMIT 1`
+    );
+    const row = parseStorageRows(result.toArray(), messageProcessingAuthorAccountRowSchema)[0];
+    return row?.author_canonical_user_id ?? null;
+  }
+
+  /**
+   * Whether a prompt queued under any account but `canonicalUserId`, or under none, has reached
+   * the agent. Prompts queued before accounts were recorded count as someone else's.
+   */
+  hasDispatchedPromptFromOtherUser(canonicalUserId: string): boolean {
+    const result = this.sql.exec(
+      `SELECT 1 AS present FROM messages
+       WHERE started_at IS NOT NULL
+         AND (author_canonical_user_id IS NULL OR author_canonical_user_id <> ?)
+       LIMIT 1`,
+      canonicalUserId
+    );
+    return result.toArray().length > 0;
+  }
+}
+
+function parseMessageRows(rows: unknown[]): MessageRow[] {
+  return parseStorageRows(rows, messageRowSchema);
+}
+
+function parseStorageRows<Schema extends z.ZodType>(
+  rows: unknown[],
+  schema: Schema
+): Array<z.infer<Schema>> {
+  return rows.map((row) => {
+    const parsed = schema.safeParse(row);
+    if (parsed.success) return parsed.data;
+    throw new SessionStorageIntegrityError("Malformed persisted message row");
+  });
 }

@@ -1,35 +1,42 @@
 /** Framework-neutral authentication and authorization for a matched route. */
 
-import {
-  SCOPED_PERMISSION_PAIRS,
-  resolveScopedPermission,
-  type PermissionId,
-} from "@open-inspect/shared/rbac";
 import { authenticate, isAuthError } from "../auth/authenticate";
-import type { Principal } from "../auth/principal";
-import type {
-  AuthorizationDecisionRequirement,
-  RouteAuthorizationDecision,
-} from "../authorization/request-audit";
+import { canonicalUserIdOf, type Principal } from "../auth/principal";
+import { PersonalAccessTokenStore } from "../db/personal-access-tokens";
+import { restrictAuthorizationToGrant } from "../authorization/personal-access-token-policy";
+import {
+  evaluateOwnedResourceAdmission,
+  ownedResourceAdmissionResponse,
+} from "../authorization/owned-resource-admission";
+import type { RouteAuthorizationDecision } from "../authorization/request-audit";
 import { AuthorizationError, AuthorizationService } from "../authorization/service";
 import { serviceAllowsPermission } from "../authorization/service-permissions";
-import { AutomationStore } from "../db/automation-store";
-import { UserStore } from "../db/user-store";
+import { parseChannelScope } from "../authorization/channel-scope";
+import { evaluateSessionAdmission } from "../authorization/session-admission";
+import { legacyPermissionForAction } from "../authorization/teams-enforcement";
+import { TeamChannelBindingStore } from "../db/team-channel-bindings";
+import { SessionIndexStore } from "../db/session-index";
 import type { RequestContext } from "../http/request-context";
 import { error, json } from "../http/responses";
 import { createLogger } from "../logger";
 import type {
   ActorlessServiceGrant,
   RouteAdmissionPolicy,
-  RouteAuthentication,
   RouteAuthorizationRequirement,
   RouteParams,
 } from "../routes/shared";
-import { SessionInternalPaths } from "../session/contracts";
-import { createSessionRuntimeClient } from "../session/runtime-client";
-import { resolveScmProviderFromEnv, SourceControlProviderError } from "../source-control";
 import type { Env } from "../types";
 import { logPrincipal } from "./request-lifecycle";
+import { verifySandboxAuthSafely } from "./sandbox-authentication";
+import { enforceImplementedScmProvider } from "./scm-provider-support";
+import { finalizeServiceActor } from "./service-actor-finalization";
+import { enforceTeamRequirement } from "./team-admission";
+import {
+  authorizationDenial,
+  authorizationUnavailable,
+  type AuthorizationEvidence,
+  type AuthorizationFailure,
+} from "./authorization-evidence";
 
 const logger = createLogger("router");
 
@@ -45,19 +52,6 @@ export type RouteAdmissionResult =
       /** Present for authorization denials; absent for authentication and infrastructure failures. */
       decision?: DeniedAuthorizationDecision;
     };
-
-/** A denial with optional audit evidence; infrastructure failures carry none. */
-export interface AuthorizationFailure {
-  response: Response;
-  decision?: DeniedAuthorizationDecision;
-  /** Deployment-capability refusals skip the general request log, as at the final gate. */
-  requestLog?: "emit" | "skip";
-}
-
-interface AuthorizationEvidence {
-  requirements: AuthorizationDecisionRequirement[];
-  effectivePermissions: PermissionId[];
-}
 
 type RouteAuthorizationResult =
   | { kind: "allowed"; decision: AllowedAuthorizationDecision }
@@ -80,33 +74,6 @@ function emptyEvidence(): AuthorizationEvidence {
   return { requirements: [], effectivePermissions: [] };
 }
 
-function authorizationDenial(
-  response: Response,
-  evidence: AuthorizationEvidence,
-  failedRequirement: AuthorizationDecisionRequirement,
-  reasonCode: string,
-  reason: string,
-  failedPermission?: PermissionId
-): AuthorizationFailure {
-  return {
-    response,
-    decision: {
-      kind: "denied",
-      ...evidence,
-      requirements: [...evidence.requirements, failedRequirement],
-      reasonCode,
-      reason,
-      ...(failedPermission ? { failedPermission } : {}),
-    },
-  };
-}
-
-function authorizationUnavailable(): AuthorizationFailure {
-  return {
-    response: json({ error: "Authorization unavailable", code: "authorization_unavailable" }, 503),
-  };
-}
-
 function resultForFailure(
   failure: AuthorizationFailure
 ): Exclude<RouteAuthorizationResult, { kind: "allowed" }> {
@@ -115,124 +82,32 @@ function resultForFailure(
     : { kind: "error", response: failure.response, requestLog: failure.requestLog };
 }
 
-function enforceImplementedScmProvider(
-  policy: RouteAdmissionPolicy,
-  path: string,
-  env: Env,
-  ctx: RequestContext
-): Response | null {
-  try {
-    const provider = resolveScmProviderFromEnv(env.SCM_PROVIDER);
-    if (
-      policy.supportedScmProviders !== "all" &&
-      !policy.supportedScmProviders.includes(provider)
-    ) {
-      logger.warn("SCM provider not implemented", {
-        event: "scm.provider_not_implemented",
-        scm_provider: provider,
-        http_path: path,
-        request_id: ctx.request_id,
-        trace_id: ctx.trace_id,
-      });
-      return error(`SCM provider '${provider}' is not implemented in this deployment.`, 501);
-    }
-
-    return null;
-  } catch (errorValue) {
-    const errorMessage =
-      errorValue instanceof SourceControlProviderError
-        ? errorValue.message
-        : "Invalid SCM provider configuration";
-
-    logger.error("Invalid SCM provider configuration", {
-      event: "scm.provider_invalid",
-      error: errorValue instanceof Error ? errorValue : String(errorValue),
-      request_id: ctx.request_id,
-      trace_id: ctx.trace_id,
-    });
-
-    return error(errorMessage, 500);
-  }
-}
-
-export function parseVerifiedSandboxId(value: unknown): string | null {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  if (!("sandboxId" in value)) return null;
-  const sandboxId = value.sandboxId;
-  return typeof sandboxId === "string" && sandboxId ? sandboxId : null;
-}
-
-async function verifySandboxAuth(
-  request: Request,
-  env: Env,
-  sessionId: string,
-  ctx: RequestContext
-): Promise<Response | null> {
-  const authHeader = request.headers.get("Authorization");
-  if (!authHeader?.startsWith("Bearer ")) {
-    return error("Unauthorized: Missing sandbox token", 401);
-  }
-
-  const token = authHeader.slice(7);
-  const verifyResponse = await createSessionRuntimeClient(env, ctx).fetch(
-    sessionId,
-    SessionInternalPaths.verifySandboxToken,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ token }),
-    }
-  );
-
-  if (!verifyResponse.ok) {
-    const clientIP = request.headers.get("CF-Connecting-IP") || "unknown";
-    logger.warn("Auth failed: sandbox", {
-      event: "auth.sandbox_failed",
-      http_path: new URL(request.url).pathname,
-      client_ip: clientIP,
-      session_id: sessionId,
-      request_id: ctx.request_id,
-      trace_id: ctx.trace_id,
-    });
-    return error("Unauthorized: Invalid sandbox token", 401);
-  }
-
-  let sandboxId: string | null = null;
-  try {
-    sandboxId = parseVerifiedSandboxId(await verifyResponse.json());
-  } catch {
-    sandboxId = null;
-  }
-  ctx.principal = { kind: "sandbox", sessionId, sandboxId };
-  return null;
-}
-
-async function verifySandboxAuthSafely(
-  request: Request,
-  env: Env,
-  sessionId: string,
-  ctx: RequestContext
-): Promise<Response | null> {
-  try {
-    return await verifySandboxAuth(request, env, sessionId, ctx);
-  } catch (cause) {
-    logger.error("Sandbox authentication unavailable", {
-      event: "auth.sandbox_unavailable",
-      session_id: sessionId,
-      error: cause instanceof Error ? cause : String(cause),
-      request_id: ctx.request_id,
-      trace_id: ctx.trace_id,
-    });
-    return error("Sandbox authentication unavailable", 503);
-  }
-}
-
-/** Reject verified principals whose kind the route's authentication policy excludes. */
+/**
+ * Reject verified principals whose kind the route's policy excludes. A personal access token is
+ * admitted only where the route declares it, whatever else the route accepts.
+ */
 export function enforceRoutePrincipal(
-  authentication: RouteAuthentication,
+  policy: Pick<RouteAdmissionPolicy, "authentication" | "personalAccessTokens">,
   principal: Principal,
   evidence: AuthorizationEvidence = emptyEvidence()
 ): AuthorizationFailure | null {
+  const authentication = policy.authentication;
+  if (principal.kind === "personal-access-token") {
+    if (policy.personalAccessTokens === "accept") return null;
+    return authorizationDenial(
+      json(
+        {
+          error: "This route does not accept personal access tokens",
+          code: "personal_access_token_not_accepted",
+        },
+        403
+      ),
+      evidence,
+      { kind: "principal-type" },
+      "personal_access_token_not_accepted",
+      "This route does not accept personal access tokens"
+    );
+  }
   if (
     authentication.kind === "web-service" &&
     (principal.kind !== "service" || principal.service !== "web")
@@ -260,10 +135,6 @@ export function enforceRoutePrincipal(
   return null;
 }
 
-/**
- * Load the canonical subject's effective authorization. Service actors reach
- * this step already finalized, so the subject is the admitted canonical user.
- */
 /** Authorization kinds whose admission loads the canonical subject's role. */
 function loadsCanonicalSubject(policy: RouteAdmissionPolicy): boolean {
   return (
@@ -273,12 +144,14 @@ function loadsCanonicalSubject(policy: RouteAdmissionPolicy): boolean {
   );
 }
 
+/**
+ * Load the canonical subject's effective authorization. Service actors reach
+ * this step already finalized, so the subject is the admitted canonical user.
+ */
 async function enforceActiveUser(
-  policy: RouteAdmissionPolicy,
   ctx: RequestContext,
   evidence: AuthorizationEvidence
 ): Promise<AuthorizationFailure | null> {
-  if (!loadsCanonicalSubject(policy)) return null;
   if (
     ctx.principal?.kind === "service" &&
     ctx.principal.actor &&
@@ -288,17 +161,17 @@ async function enforceActiveUser(
     // actor here means enrollment was skipped, so never authorize it.
     return authorizationUnavailable();
   }
-  const userId =
-    ctx.principal?.kind === "user"
-      ? ctx.principal.userId
-      : ctx.principal?.kind === "service"
-        ? ctx.principal.actor?.canonicalUserId
-        : null;
+  const userId = canonicalUserIdOf(ctx.principal);
   if (!userId) return null;
   const requirement = { kind: "active-user" } as const;
   try {
     const authorization = await new AuthorizationService(ctx.db).getEffectiveAuthorization(userId);
-    ctx.authorization = authorization;
+    // A token acts as its owner within its grant. Narrowing here, where the subject's
+    // authorization is loaded, is what every later permission check reads.
+    ctx.authorization =
+      ctx.principal?.kind === "personal-access-token"
+        ? restrictAuthorizationToGrant(authorization, ctx.principal.grant)
+        : authorization;
     if (authorization.suspendedAt !== null) {
       return authorizationDenial(
         json({ error: "Forbidden", code: "active_user_required" }, 403),
@@ -340,7 +213,16 @@ function enforceStaticServicePermissionCeiling(
   if (policy.authorization.kind !== "active-user") return null;
 
   for (const requirement of policy.authorization.allOf) {
-    const permission = requirement.kind === "permission" ? requirement.permission : null;
+    const permission =
+      requirement.kind === "permission"
+        ? requirement.permission
+        : requirement.kind === "session"
+          ? legacyPermissionForAction(requirement.action)
+          : requirement.kind === "environment"
+            ? (`environments.${requirement.need}` as const)
+            : requirement.kind === "automation" && requirement.operation === "read"
+              ? "automations.read"
+              : null;
     if (permission && !serviceAllowsPermission(principal.service, permission)) {
       return authorizationDenial(
         json({ error: "Forbidden", code: "service_capability_required" }, 403),
@@ -355,66 +237,60 @@ function enforceStaticServicePermissionCeiling(
   return null;
 }
 
-/**
- * Resolve the verified service actor to its canonical user exactly once,
- * before any RBAC lookup, so the subject authorized is the subject attributed.
- */
-async function finalizeServiceActor(
-  policy: RouteAdmissionPolicy,
+async function enforceSlackWriteScope(
+  params: RouteParams,
   request: Request,
   pathname: string,
-  env: Env,
-  ctx: RequestContext
+  ctx: RequestContext,
+  evidence: AuthorizationEvidence
 ): Promise<AuthorizationFailure | null> {
-  if (!loadsCanonicalSubject(policy)) return null;
-  const principal = ctx.principal;
-  if (principal?.kind !== "service" || !principal.actor || principal.actor.canonicalUserId) {
+  if (
+    ctx.principal?.kind !== "service" ||
+    ctx.principal.service !== "slack-bot" ||
+    request.method !== "POST" ||
+    !/^\/sessions\/[^/]+\/(prompt|attachments)$/.test(pathname)
+  ) {
     return null;
   }
 
-  // Deployment capability does not depend on the caller: a request this
-  // deployment cannot serve must not enroll a user, identity, or assignment.
-  const providerCheck = enforceImplementedScmProvider(policy, pathname, env, ctx);
-  if (providerCheck) return { response: providerCheck, requestLog: "skip" };
+  const refusal = { error: "Slack channel scope denied", code: "slack_channel_scope_denied" };
+  const deny = (status: 400 | 403 | 404): AuthorizationFailure =>
+    authorizationDenial(
+      json(refusal, status),
+      evidence,
+      { kind: "session", sessionIdParam: "id", action: "collaborate" },
+      refusal.code,
+      refusal.error
+    );
+  const channels = new URL(request.url).searchParams.getAll("channel");
+  const scope = channels.length === 1 ? parseChannelScope(channels[0]) : null;
+  if (!scope || scope.provider !== "slack") return deny(400);
 
   try {
-    const prepared = policy.serviceActorClaims
-      ? await policy.serviceActorClaims(request.clone(), ctx)
-      : null;
-    // The route refused this body: answer with its response and write nothing.
-    if (prepared?.kind === "rejected") return { response: prepared.response };
-    const claims = prepared?.claims;
-    const actor = principal.actor;
-    const user = await new UserStore(ctx.db).resolveOrCreateUser({
-      provider: actor.provider,
-      providerUserId: actor.providerUserId,
-      displayName: claims?.displayName,
-      providerEmail:
-        actor.provider === "slack" || actor.provider === "linear" ? claims?.email : undefined,
-      avatarUrl: claims?.avatarUrl,
-    });
-    ctx.principal = {
-      ...principal,
-      actor: { ...actor, canonicalUserId: user.id },
-    };
+    const [binding, session] = await Promise.all([
+      new TeamChannelBindingStore(ctx.db).get("slack", scope.externalId),
+      new SessionIndexStore(ctx.db).get(params.id),
+    ]);
+    if (!session) return deny(404);
+    if ((binding?.teamId ?? null) !== session.ownerTeamId) return deny(403);
+    // Actor collaboration is authorized separately after this live channel check.
     return null;
   } catch (cause) {
-    logger.error("Failed to finalize verified service actor", {
-      event: "auth.service_actor_resolution_failed",
+    logger.error("Slack channel scope authorization unavailable", {
+      event: "authorization.slack_channel_scope_unavailable",
       error: cause instanceof Error ? cause : String(cause),
       request_id: ctx.request_id,
       trace_id: ctx.trace_id,
     });
-    return authorizationUnavailable();
+    return { response: json(refusal, 503) };
   }
 }
 
 function authorizationUserId(ctx: RequestContext): string | null {
-  if (ctx.principal?.kind === "user") return ctx.principal.userId;
   if (ctx.principal?.kind === "service") {
     return ctx.principal.actor?.canonicalUserId ?? ctx.authorization?.userId ?? null;
   }
-  return null;
+  return canonicalUserIdOf(ctx.principal);
 }
 
 function actorlessGrantMatches(
@@ -528,53 +404,118 @@ async function enforcePermissionRequirement(
   );
 }
 
-async function enforceAutomationRequirement(
-  requirement: Extract<RouteAuthorizationRequirement, { kind: "automation" }>,
+async function enforceOwnedResourceRequirement(
+  requirement: Extract<RouteAuthorizationRequirement, { kind: "automation" | "environment" }>,
   params: RouteParams,
   ctx: RequestContext,
   evidence: AuthorizationEvidence
 ): Promise<AuthorizationFailure | null> {
-  if (ctx.principal?.kind !== "user") {
-    // Ownership is defined for canonical human users only. Service policy
-    // normally rejects bots earlier; this keeps a future `requireAll`
-    // composition from skipping the ownership check.
-    return authorizationDenial(
-      json({ error: "Forbidden", code: "service_capability_required" }, 403),
-      evidence,
-      requirement,
-      "service_capability_required",
-      "Forbidden"
-    );
-  }
-  const automationId = params[requirement.automationIdParam];
-  if (!automationId) return { response: json({ error: "Invalid automation route" }, 400) };
-
   try {
-    const authorization = ctx.authorization;
-    if (!authorization) throw new Error("Missing request authorization");
-    const store = new AutomationStore(ctx.db);
-    const storedAutomation = await store.getById(automationId);
-    if (!storedAutomation) return { response: error("Automation not found", 404) };
-    const automation = await store.resolveCanonicalOwner(storedAutomation);
-
-    const permissionStem = `automations.${requirement.operation}` as const;
-    const pair = SCOPED_PERMISSION_PAIRS[permissionStem];
-    const isOwner = automation.user_id === ctx.principal.userId;
-    const scope = resolveScopedPermission(permissionStem, authorization.permissions);
-    if (!scope || (scope === "own" && !isOwner)) {
+    const result = await evaluateOwnedResourceAdmission(requirement, params, ctx);
+    // Denials keep the loaded environment too, so the audit attributes its owner team.
+    if (result.kind !== "error" && "admission" in result && result.admission) {
+      ctx.environmentAdmission = result.admission;
+    }
+    if (result.kind === "error") {
+      return { response: ownedResourceAdmissionResponse(result) };
+    }
+    if (result.kind === "denied") {
       return authorizationDenial(
-        json({ error: "Forbidden", code: "permission_required", permission: pair.own }, 403),
+        ownedResourceAdmissionResponse(result),
         evidence,
         requirement,
-        "permission_required",
-        "Forbidden",
-        pair.own
+        result.reasonCode,
+        result.reason,
+        result.failedPermission
       );
     }
-
     evidence.requirements.push(requirement);
-    evidence.effectivePermissions.push(pair[scope]);
-    ctx.automationAdmission = { automation };
+    if (result.effectivePermission) evidence.effectivePermissions.push(result.effectivePermission);
+    return null;
+  } catch {
+    return authorizationUnavailable();
+  }
+}
+
+async function enforceSessionRequirement(
+  requirement: Extract<RouteAuthorizationRequirement, { kind: "session" }>,
+  params: RouteParams,
+  request: Request,
+  env: Env,
+  ctx: RequestContext,
+  evidence: AuthorizationEvidence
+): Promise<AuthorizationFailure | null> {
+  const sessionId = params[requirement.sessionIdParam];
+  if (!sessionId) return { response: json({ error: "Invalid session route" }, 400) };
+  try {
+    if (ctx.principal?.kind === "service" && !ctx.principal.actor) {
+      const query = new URL(request.url).searchParams;
+      const channels = query.getAll("channel");
+      const postRead = query.get("purpose") === "slack-post";
+      if (postRead && (channels.length !== 1 || ctx.principal.service !== "slack-bot")) {
+        return authorizationDenial(
+          error("Session not found", 404),
+          evidence,
+          requirement,
+          "session_not_visible",
+          "Session not found"
+        );
+      }
+      if (channels.length > 0) {
+        const scope = channels.length === 1 ? parseChannelScope(channels[0]) : null;
+        if (!scope || ctx.principal.service !== `${scope.provider}-bot`) {
+          return authorizationDenial(
+            error("Session not found", 404),
+            evidence,
+            requirement,
+            "session_not_visible",
+            "Session not found"
+          );
+        }
+        ctx.serviceTeamId =
+          (await new TeamChannelBindingStore(ctx.db).get(scope.provider, scope.externalId))
+            ?.teamId ?? null;
+        if (postRead) ctx.serviceReadPurpose = "slack-post";
+      }
+    }
+    const result = await evaluateSessionAdmission(
+      ctx,
+      env,
+      sessionId,
+      requirement.action,
+      requirement.sessionIdParam === "childId" ? "child" : "session",
+      requirement.enforceAlways
+    );
+    if (result.kind === "not_found") {
+      return authorizationDenial(
+        error("Session not found", 404),
+        evidence,
+        requirement,
+        "session_not_visible",
+        "Session not found"
+      );
+    }
+    if (result.kind === "action_denied") {
+      return authorizationDenial(
+        json(
+          { error: "Forbidden", code: "session_action_denied", reason_code: result.reason },
+          403
+        ),
+        evidence,
+        requirement,
+        result.reason,
+        "Forbidden"
+      );
+    }
+    if (result.legacyPermission) {
+      const legacy = await enforcePermissionRequirement(
+        { kind: "permission", permission: result.legacyPermission },
+        ctx,
+        evidence
+      );
+      if (legacy) return legacy;
+    }
+    evidence.requirements.push(requirement);
     return null;
   } catch {
     return authorizationUnavailable();
@@ -599,7 +540,7 @@ function allowed(
 
 /**
  * Ordered trust transition for an authenticated request: principal kind,
- * sandbox capability, service capability and ceiling, actor finalization,
+ * sandbox capability, service capability and ceiling, Slack write scope, actor finalization,
  * active canonical subject, then route permission and resource requirements.
  */
 async function enforceRouteAuthorization(
@@ -620,7 +561,7 @@ async function enforceRouteAuthorization(
     return allowed(policy, "user", evidence);
   }
 
-  const principalFailure = enforceRoutePrincipal(policy.authentication, principal, evidence);
+  const principalFailure = enforceRoutePrincipal(policy, principal, evidence);
   if (principalFailure) return resultForFailure(principalFailure);
 
   if (
@@ -637,11 +578,16 @@ async function enforceRouteAuthorization(
   const ceilingFailure = enforceStaticServicePermissionCeiling(policy, ctx, evidence);
   if (ceilingFailure) return resultForFailure(ceilingFailure);
 
-  const actorFailure = await finalizeServiceActor(policy, request, pathname, env, ctx);
-  if (actorFailure) return resultForFailure(actorFailure);
+  const scopeFailure = await enforceSlackWriteScope(params, request, pathname, ctx, evidence);
+  if (scopeFailure) return resultForFailure(scopeFailure);
 
-  const activeUserFailure = await enforceActiveUser(policy, ctx, evidence);
-  if (activeUserFailure) return resultForFailure(activeUserFailure);
+  if (loadsCanonicalSubject(policy)) {
+    const actorFailure = await finalizeServiceActor(policy, request, pathname, env, ctx);
+    if (actorFailure) return resultForFailure(actorFailure);
+
+    const activeUserFailure = await enforceActiveUser(ctx, evidence);
+    if (activeUserFailure) return resultForFailure(activeUserFailure);
+  }
 
   if (policy.authorization.kind === "active-user") {
     for (const requirement of policy.authorization.allOf) {
@@ -651,16 +597,39 @@ async function enforceRouteAuthorization(
           failure = await enforcePermissionRequirement(requirement, ctx, evidence);
           break;
         case "automation":
-          failure = await enforceAutomationRequirement(requirement, params, ctx, evidence);
+        case "environment":
+          failure = await enforceOwnedResourceRequirement(requirement, params, ctx, evidence);
+          break;
+        case "team":
+          failure = await enforceTeamRequirement(requirement, params, ctx, evidence);
+          break;
+        case "session":
+          failure = await enforceSessionRequirement(
+            requirement,
+            params,
+            request,
+            env,
+            ctx,
+            evidence
+          );
           break;
       }
       if (failure) return resultForFailure(failure);
     }
   }
 
-  const admission =
-    principal.kind === "service" ? "service" : principal.kind === "sandbox" ? "sandbox" : "user";
-  return allowed(policy, admission, evidence);
+  return allowed(policy, principal.kind, evidence);
+}
+
+/**
+ * Record that a token was presented, off the request's critical path. Here rather than in
+ * `authenticate()`, whose narrow port has no background tasks.
+ */
+function recordPersonalAccessTokenUse(ctx: RequestContext, tokenId: string): void {
+  ctx.executionCtx.submit(
+    () => new PersonalAccessTokenStore(ctx.db).touchLastUsed(tokenId, Date.now()),
+    { name: "personal-access-token.touch-last-used", context: { token_id: tokenId } }
+  );
 }
 
 export async function admitRoute(input: {
@@ -712,6 +681,9 @@ export async function admitRoute(input: {
         ctx.principal = authResult.principal;
         ctx.authentication = authResult.authentication;
         handlerRequest = authResult.request;
+        if (authResult.principal.kind === "personal-access-token") {
+          recordPersonalAccessTokenUse(ctx, authResult.principal.tokenId);
+        }
       }
     }
 

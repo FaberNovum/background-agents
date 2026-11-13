@@ -10,13 +10,22 @@ from typing import TYPE_CHECKING, Any, Final
 
 from websockets import State
 
+from .event_size import (
+    MAX_EVENT_BYTES,
+    event_size_bytes,
+    truncate_critical_error,
+    truncate_tool_call,
+)
+
 if TYPE_CHECKING:
     from websockets import ClientConnection
 
     from .log_config import StructuredLogger
 
 # Critical events are retained until the control plane acknowledges them and
-# are re-sent on reconnect; everything else is delivered at most once.
+# are re-sent on reconnect. Everything else is delivered at most once, with
+# one exception: a write that times out may already have reached the peer, so
+# replaying it can duplicate a non-critical event across connections.
 CRITICAL_EVENT_TYPES: Final[frozenset[str]] = frozenset(
     {
         "execution_complete",
@@ -30,10 +39,12 @@ CRITICAL_EVENT_TYPES: Final[frozenset[str]] = frozenset(
 )
 MAX_EVENT_BUFFER_SIZE: Final = 1000
 
-# Bound on a direct send and on each recovery stage. A failed direct send may
-# spend one additional budget acquiring the recovery lock and flushing after
-# a rebind, so send() takes at most two configured budgets before returning.
+# Bound on every write and on each recovery stage. Retiring a connection
+# whose write timed out is synchronous and costs nothing, so a failed direct
+# send may spend only one further budget acquiring the recovery lock and
+# flushing after a rebind: send() returns within two configured budgets.
 SEND_TIMEOUT_SECONDS: Final = 30.0
+EVICTION_WARNING_INTERVAL_SECONDS: Final = 30.0
 
 
 class BufferedEventForwarder:
@@ -52,7 +63,10 @@ class BufferedEventForwarder:
       and a concurrent bind can never both walk the buffer.
 
     The owner drives the connection lifecycle explicitly via ``bind`` /
-    ``unbind``; the forwarder never reaches back into its owner.
+    ``unbind``, with one exception: a write that times out leaves a
+    connection nothing else can end, so the forwarder aborts it (see
+    ``_retire_timed_out_connection``). It still never reaches back into its
+    owner — ending the socket is what lets the owner notice and reconnect.
     """
 
     def __init__(
@@ -85,6 +99,29 @@ class BufferedEventForwarder:
         # excludes them from pending replay; their owning send reconciles the
         # ACK and any failure before deciding whether one buffered copy remains.
         self._in_flight_acks: dict[str, dict[str, Any]] = {}
+
+        # The connection a recovery write was parked on when something
+        # cancelled it. A cancelled write reports nothing about its
+        # connection and cannot retire it, so it leaves the identity here for
+        # whichever recovery stage owns the deadline that cancelled it.
+        self._cancelled_write_ws: ClientConnection | None = None
+        self._evicted_events = 0
+        self._evicted_critical_events = 0
+        self._suppressed_eviction_warnings = 0
+        # Critical evictions always warn; only noncritical warnings share this
+        # rate limit, so critical bursts cannot suppress noncritical identities.
+        self._last_noncritical_eviction_warning_monotonic: float | None = None
+
+    def health_snapshot(self) -> dict[str, int]:
+        """Read-only delivery pressure counters, without event payloads."""
+        return {
+            "buffer_size": len(self._event_buffer),
+            "pending_acks": len(self._pending_acks),
+            "in_flight_acks": len(self._in_flight_acks),
+            "evicted_events": self._evicted_events,
+            "evicted_critical_events": self._evicted_critical_events,
+            "suppressed_eviction_warnings": self._suppressed_eviction_warnings,
+        }
 
     async def bind(self, ws: ClientConnection) -> None:
         """Attach a live control-plane connection and recover the backlog.
@@ -130,6 +167,30 @@ class BufferedEventForwarder:
         if is_critical and "ackId" not in event:
             event["ackId"] = self._make_ack_id(event)
 
+        size_bytes = event_size_bytes(event)
+        if size_bytes > MAX_EVENT_BYTES:
+            if event_type == "tool_call":
+                self._log.warn(
+                    "bridge.event_oversized", event_type=event_type, size_bytes=size_bytes
+                )
+                try:
+                    event = truncate_tool_call(event)
+                except ValueError:
+                    return False
+            elif is_critical:
+                self._log.warn(
+                    "bridge.event_oversized", event_type=event_type, size_bytes=size_bytes
+                )
+                bounded = truncate_critical_error(event, size_bytes)
+                if bounded is None:
+                    return False
+                event = bounded
+            else:
+                self._log.warn(
+                    "bridge.event_oversized", event_type=event_type, size_bytes=size_bytes
+                )
+                return False
+
         ws = self._ws
         if not ws or ws.state != State.OPEN:
             if buffered:
@@ -143,7 +204,7 @@ class BufferedEventForwarder:
             self._pending_acks[ack_id] = event
             self._in_flight_acks[ack_id] = event
         try:
-            await asyncio.wait_for(ws.send(json.dumps(event)), timeout=self._send_timeout_seconds)
+            await self._write(ws, event)
         except asyncio.CancelledError:
             # A prompt task cancelled mid-send must not strand its event:
             # re-buffer it, then let the cancellation proceed. An unbuffered
@@ -157,20 +218,74 @@ class BufferedEventForwarder:
                 self._log.debug("bridge.event_dropped_cancelled", event_type=event_type)
             raise
         except Exception as e:
-            self._log.warn("bridge.send_error", event_type=event_type, exc=e)
+            # Settle the failed attempt before snapshotting so the warning
+            # reports the state the forwarder is actually left in.
+            self._clear_in_flight(ack_id, event)
             replayable = ack_id is None or self._pending_acks.get(ack_id) is event
             if ack_id is not None and replayable:
                 self._pending_acks.pop(ack_id, None)
-            if not buffered or not replayable:
+            if buffered and replayable:
+                self._buffer_event(event)
+            self._log.warn(
+                "bridge.send_error",
+                event_type=event_type,
+                message_id=event.get("messageId"),
+                ack_id=ack_id,
+                exc=e,
+                **self.health_snapshot(),
+            )
+            if buffered and replayable:
+                await self._drain_if_rebound(failed_ws=ws)
+            else:
                 self._log.debug("bridge.event_dropped_send_failed", event_type=event_type)
-                return False
-            self._buffer_event(event)
-            await self._drain_if_rebound(failed_ws=ws)
             return False
         finally:
-            if ack_id is not None and self._in_flight_acks.get(ack_id) is event:
-                self._in_flight_acks.pop(ack_id, None)
+            self._clear_in_flight(ack_id, event)
         return True
+
+    def _clear_in_flight(self, ack_id: str | None, event: dict[str, Any]) -> None:
+        if ack_id is not None and self._in_flight_acks.get(ack_id) is event:
+            self._in_flight_acks.pop(ack_id, None)
+
+    async def _write(self, ws: ClientConnection, event: dict[str, Any]) -> None:
+        """Write one event, retiring the connection if the write stalls.
+
+        Every write in this class goes through here, so "a stalled write
+        retires its connection" is one policy instead of three copies that
+        can drift. This owns only the transport verdict; each caller keeps
+        its own ACK and buffer reconciliation in its exception handlers.
+        """
+        try:
+            await asyncio.wait_for(ws.send(json.dumps(event)), timeout=self._send_timeout_seconds)
+        except TimeoutError:
+            self._retire_timed_out_connection(ws)
+            raise
+
+    def _retire_timed_out_connection(self, ws: ClientConnection) -> None:
+        """Abort a connection whose write timed out, so the owner reconnects.
+
+        A peer that stops reading leaves the socket OPEN indefinitely: the
+        write parks in flow control, and the keepalive ping parks behind it
+        before its pong deadline is armed, so the connection never fails on
+        its own. The owner's receive loop only ends when the connection does,
+        so ending it here is the single signal that starts a reconnect —
+        without it every later send re-enters the same dead socket and burns
+        another timeout.
+
+        Abort rather than close. ``close()`` writes its close frame through
+        the very flow control that just stalled, and websockets' own
+        ``close_timeout`` does not cover that wait, so a graceful close parks
+        exactly like the write did. Waiting on it would spend the window the
+        owner still needs to reconnect and heartbeat in before the control
+        plane calls the sandbox stale. Aborting is synchronous, so retirement
+        also stays off the cancellation path entirely.
+
+        Only this connection is retired. A replacement bound while the write
+        was parked stays bound, and the caller drains through it.
+        """
+        if self._ws is ws:
+            self._ws = None
+        ws.transport.abort()
 
     def acknowledge(self, ack_id: str) -> bool:
         """Drop a pending critical event the control plane confirmed.
@@ -201,6 +316,7 @@ class BufferedEventForwarder:
         """
         current = self._ws
         if current is not None and current is not failed_ws and current.state == State.OPEN:
+            self._cancelled_write_ws = None
             try:
                 async with asyncio.timeout(self._send_timeout_seconds):
                     async with self._recovery_lock:
@@ -209,14 +325,25 @@ class BufferedEventForwarder:
                 # send() already buffered the event before recovery. Leave
                 # that single copy for a later bind rather than buffering it
                 # again when lock acquisition or flushing exhausts the stage.
-                self._log.warn("bridge.rebound_recovery_timeout", exc=e)
+                self._log.warn("bridge.rebound_recovery_timeout", exc=e, **self.health_snapshot())
+                # This deadline is armed before the flush arms its own, so it
+                # is what cancels a stalled flush write — and a cancelled
+                # write cannot retire its connection. Retire it here, but
+                # only when a write was actually cancelled: a stage spent
+                # waiting for the lock proves nothing about the connection.
+                stalled = self._cancelled_write_ws
+                self._cancelled_write_ws = None
+                if stalled is not None:
+                    self._retire_timed_out_connection(stalled)
 
     async def _flush_buffer(self) -> None:
         """Flush buffered events over the currently bound connection.
 
         Must run under ``_recovery_lock``. The connection is re-read every
         iteration so a rebind while flushing migrates the walk onto the new
-        connection.
+        connection. A write that times out retires its connection, exactly as
+        on the direct path: recovery is often the first write to a fresh
+        connection, so it may be the first to find one already wedged.
 
         Known debt: an event ``json.dumps`` cannot serialize would be a
         poison pill at the buffer head — every flush breaks on it.
@@ -237,15 +364,17 @@ class BufferedEventForwarder:
                 self._pending_acks[ack_id] = event
                 self._in_flight_acks[ack_id] = event
             try:
-                await asyncio.wait_for(
-                    ws.send(json.dumps(event)), timeout=self._send_timeout_seconds
-                )
+                await self._write(ws, event)
             except asyncio.CancelledError:
                 acknowledged = ack_id is not None and self._pending_acks.get(ack_id) is not event
                 if ack_id is not None and not acknowledged:
                     self._pending_acks.pop(ack_id, None)
                 if acknowledged and self._event_buffer and self._event_buffer[0] is event:
                     self._event_buffer.pop(0)
+                # This write never got to time out, so it cannot tell whether
+                # the connection is wedged or retire it. Record it for the
+                # recovery stage whose deadline is the likely canceller.
+                self._cancelled_write_ws = ws
                 raise
             except Exception as e:
                 acknowledged = ack_id is not None and self._pending_acks.get(ack_id) is not event
@@ -253,11 +382,18 @@ class BufferedEventForwarder:
                     self._pending_acks.pop(ack_id, None)
                 if acknowledged and self._event_buffer and self._event_buffer[0] is event:
                     self._event_buffer.pop(0)
-                self._log.warn("bridge.flush_send_error", exc=e)
+                self._clear_in_flight(ack_id, event)
+                self._log.warn(
+                    "bridge.flush_send_error",
+                    event_type=event.get("type", "unknown"),
+                    message_id=event.get("messageId"),
+                    ack_id=ack_id,
+                    exc=e,
+                    **self.health_snapshot(),
+                )
                 break
             finally:
-                if ack_id is not None and self._in_flight_acks.get(ack_id) is event:
-                    self._in_flight_acks.pop(ack_id, None)
+                self._clear_in_flight(ack_id, event)
 
             # The send succeeded, but a concurrent overflow eviction may have
             # removed our claimed head while the send was in flight — pop by
@@ -294,12 +430,17 @@ class BufferedEventForwarder:
             if not ws or ws.state != State.OPEN:
                 break
             try:
-                await asyncio.wait_for(
-                    ws.send(json.dumps(event)), timeout=self._send_timeout_seconds
-                )
+                await self._write(ws, event)
                 resent += 1
             except Exception as e:
-                self._log.warn("bridge.flush_pending_ack_error", ack_id=ack_id, exc=e)
+                self._log.warn(
+                    "bridge.flush_pending_ack_error",
+                    ack_id=ack_id,
+                    event_type=event.get("type", "unknown"),
+                    message_id=event.get("messageId"),
+                    exc=e,
+                    **self.health_snapshot(),
+                )
                 break
 
         self._log.info(
@@ -310,23 +451,51 @@ class BufferedEventForwarder:
 
     def _buffer_event(self, event: dict[str, Any]) -> None:
         """Buffer an event for later delivery after WS reconnect."""
+        evicted: dict[str, Any] | None = None
         if len(self._event_buffer) >= self._max_buffer_size:
             # Evict oldest non-critical event; fall back to oldest if all critical
-            evicted = False
             for i, buffered in enumerate(self._event_buffer):
                 if buffered.get("type") not in CRITICAL_EVENT_TYPES:
-                    self._event_buffer.pop(i)
-                    evicted = True
+                    evicted = self._event_buffer.pop(i)
                     break
-            if not evicted:
-                self._event_buffer.pop(0)
+            if evicted is None:
+                evicted = self._event_buffer.pop(0)
 
         self._event_buffer.append(event)
+        if evicted is not None:
+            self._record_eviction(evicted)
         self._log.debug(
             "bridge.event_buffered",
             event_type=event.get("type", "unknown"),
             buffer_size=len(self._event_buffer),
         )
+
+    def _record_eviction(self, event: dict[str, Any]) -> None:
+        """Report overflow without flooding logs during a disconnected stream."""
+        critical = event.get("type") in CRITICAL_EVENT_TYPES
+        self._evicted_events += 1
+        self._evicted_critical_events += int(critical)
+        now = time.monotonic()
+        if (
+            not critical
+            and self._last_noncritical_eviction_warning_monotonic is not None
+            and now - self._last_noncritical_eviction_warning_monotonic
+            < EVICTION_WARNING_INTERVAL_SECONDS
+        ):
+            self._suppressed_eviction_warnings += 1
+            return
+        self._log.warn(
+            "bridge.event_buffer_evicted",
+            event_type=event.get("type", "unknown"),
+            message_id=event.get("messageId"),
+            ack_id=event.get("ackId"),
+            critical=critical,
+            max_buffer_size=self._max_buffer_size,
+            **self.health_snapshot(),
+        )
+        if not critical:
+            self._last_noncritical_eviction_warning_monotonic = now
+            self._suppressed_eviction_warnings = 0
 
     @staticmethod
     def _make_ack_id(event: dict[str, Any]) -> str:

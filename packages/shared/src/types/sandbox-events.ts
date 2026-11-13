@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { artifactTypeSchema } from "./artifacts";
 import { harnessIdSchema } from "../harnesses";
 import { sessionDiffBaselineRepositorySchema } from "./session-diffs";
 import { resolvedSessionAttachmentsSchema } from "./session-attachments";
@@ -34,7 +35,8 @@ const tokenUsageDetailsSchema = z
     { message: "Expected at least one token usage count" }
   );
 
-const tokenUsageSchema = z.union([z.number(), tokenUsageDetailsSchema]);
+export const tokenUsageSchema = z.union([z.number(), tokenUsageDetailsSchema]);
+export type TokenUsage = z.infer<typeof tokenUsageSchema>;
 
 /** The steps of a sandbox boot, in the order the supervisor runs them. */
 export const bootPhaseNameSchema = z.enum([
@@ -43,6 +45,7 @@ export const bootPhaseNameSchema = z.enum([
   "setup",
   "start",
   "skills",
+  "memory",
   "harness",
 ]);
 export type BootPhaseName = z.infer<typeof bootPhaseNameSchema>;
@@ -86,21 +89,20 @@ const sandboxEventBaseSchema = z.object({
 const messageSandboxEventBaseSchema = sandboxEventBaseSchema.extend({
   messageId: z.string(),
 });
+const stepIdSchema = z.string().min(1).optional();
 
 export const sandboxGenerationSchema = z.object({
   sandboxId: z.string().min(1),
   createdAt: z.number().int().positive(),
 });
 
-// Sandbox events from Modal or synthesized by the control plane.
-export const sandboxEventSchema = z.discriminatedUnion("type", [
+const nonArtifactSandboxEventSchemas = [
   sandboxEventBaseSchema.extend({
     type: z.literal("heartbeat"),
-    status: z.string(),
   }),
   sandboxEventBaseSchema.extend({
-    // Emitted on every sandbox bridge connect (bridge readiness, not vendor
-    // readiness). Present in essentially every session's replay history.
+    // Emitted after the runtime attaches its harness. This is the readiness
+    // signal that moves the sandbox row to `ready`.
     type: z.literal("ready"),
     opencodeSessionId: z.string().nullable().optional(),
     /** Which harness the runtime booted; the session DO warns when it differs from the session's. */
@@ -109,6 +111,9 @@ export const sandboxEventSchema = z.discriminatedUnion("type", [
     // snapshot it produces so a later restore can be gated on it.
     runtimeVersion: z.string().optional(),
     preservationProtocolVersion: z.literal(1).optional(),
+    managedMcpVersion: z.union([z.literal(0), z.literal(1)]).optional(),
+    // Stable across transport reconnects, new for every bridge process.
+    bridgeInstanceId: z.string().uuid().optional(),
     repositories: z.array(sessionDiffBaselineRepositorySchema).optional(),
   }),
   sandboxEventBaseSchema.extend({
@@ -125,6 +130,7 @@ export const sandboxEventSchema = z.discriminatedUnion("type", [
   messageSandboxEventBaseSchema.extend({
     type: z.literal("token"),
     content: z.string(),
+    partId: z.string().min(1).optional(),
   }),
   messageSandboxEventBaseSchema.extend({
     type: z.literal("tool_call"),
@@ -133,18 +139,23 @@ export const sandboxEventSchema = z.discriminatedUnion("type", [
     callId: z.string(),
     status: z.string().optional(),
     output: z.string().optional(),
+    truncated: z
+      .object({ fields: z.array(z.string()), originalBytes: z.number().int().nonnegative() })
+      .optional(),
     isSubtask: z.boolean().optional(),
     childSessionId: z.string().optional(),
     taskCallId: z.string().optional(),
   }),
   messageSandboxEventBaseSchema.extend({
     type: z.literal("step_start"),
+    stepId: stepIdSchema,
     isSubtask: z.boolean().optional(),
     childSessionId: z.string().optional(),
     taskCallId: z.string().optional(),
   }),
   messageSandboxEventBaseSchema.extend({
     type: z.literal("step_finish"),
+    stepId: stepIdSchema,
     /** Cost of this step alone; absent when the runtime could not price it. */
     cost: z.number().nullable().optional(),
     /** Cumulative reported cost of the whole turn so far; idempotent on resend. */
@@ -175,6 +186,7 @@ export const sandboxEventSchema = z.discriminatedUnion("type", [
   }),
   messageSandboxEventBaseSchema.extend({
     type: z.literal("execution_complete"),
+    managedMcpReady: z.boolean().optional(),
     success: z.boolean(),
     error: z.string().optional(),
     /** Final cumulative reported cost of the turn. */
@@ -182,14 +194,6 @@ export const sandboxEventSchema = z.discriminatedUnion("type", [
   }),
   messageSandboxEventBaseSchema.extend({
     type: z.literal("context_compacted"),
-  }),
-  sandboxEventBaseSchema.extend({
-    type: z.literal("artifact"),
-    artifactType: z.string(),
-    artifactId: z.string().optional(),
-    url: z.string(),
-    metadata: recordSchema.optional(),
-    messageId: z.string().optional(),
   }),
   // Push events: repoOwner/repoName identify the repository in a multi-repo
   // session (absent means the session's sole repo). branchName is optional
@@ -220,7 +224,18 @@ export const sandboxEventSchema = z.discriminatedUnion("type", [
   // unknown union entries, so this entry must exist before runtimes emit it.
   z.object({
     type: z.literal("warning"),
-    scope: z.enum(["sync", "setup", "start", "assembly", "secrets", "media", "budget", "provider"]),
+    scope: z.enum([
+      "sync",
+      "setup",
+      "start",
+      "assembly",
+      "secrets",
+      "media",
+      "budget",
+      "provider",
+      "mcp",
+    ]),
+    messageId: z.string().optional(),
     message: z.string(),
     repoOwner: z.string().optional(),
     repoName: z.string().optional(),
@@ -278,6 +293,29 @@ export const sandboxEventSchema = z.discriminatedUnion("type", [
     attachments: resolvedSessionAttachmentsSchema.optional(),
     origin: githubAutofixOriginSchema.optional(),
   }),
+] as const;
+
+const sandboxArtifactEventSchema = sandboxEventBaseSchema.extend({
+  type: z.literal("artifact"),
+  artifactType: artifactTypeSchema,
+  artifactId: z.string().optional(),
+  url: z.string(),
+  metadata: recordSchema.optional(),
+  messageId: z.string().optional(),
+});
+
+/** Files are registered by the server after upload validation. */
+export const sandboxAdmissibleArtifactTypeSchema = artifactTypeSchema.exclude(["file"]);
+export const sandboxIngressEventSchema = z.discriminatedUnion("type", [
+  ...nonArtifactSandboxEventSchemas,
+  sandboxArtifactEventSchema.extend({ artifactType: sandboxAdmissibleArtifactTypeSchema }),
+]);
+export type SandboxIngressEvent = z.infer<typeof sandboxIngressEventSchema>;
+
+// Includes server-registered artifacts for broadcasts and snapshots.
+export const sandboxEventSchema = z.discriminatedUnion("type", [
+  ...nonArtifactSandboxEventSchemas,
+  sandboxArtifactEventSchema,
 ]);
 
 export type SandboxEvent = z.infer<typeof sandboxEventSchema>;

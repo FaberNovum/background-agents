@@ -7,7 +7,9 @@ import { describe, it, expect, beforeEach } from "vitest";
 import { env } from "cloudflare:test";
 import { SessionIndexStore } from "../../src/db/session-index";
 import { cleanD1Tables } from "./cleanup";
-import { initSession, queryDO, serviceFetch } from "./helpers";
+import { enrollSlackActor, initSession, queryDO, serviceFetch } from "./helpers";
+
+const internal = { kind: "internal", reason: "session repositories integration tests" } as const;
 
 type MemberRow = {
   position: number;
@@ -95,6 +97,8 @@ describe("D1 session index repositories", () => {
     const now = Date.now();
     return {
       id,
+      ownerTeamId: null,
+      visibility: "workspace" as const,
       title: null,
       repoOwner: repositories?.[0]?.repoOwner ?? "acme",
       repoName: repositories?.[0]?.repoName ?? "web-app",
@@ -124,7 +128,7 @@ describe("D1 session index repositories", () => {
       ])
     );
 
-    const { sessions } = await store.list();
+    const { sessions } = await store.list({ readScope: internal, mode: "on" });
     expect(sessions).toHaveLength(1);
     expect(sessions[0].repositories).toEqual([
       { repoOwner: "acme", repoName: "frontend", repoId: 1, baseBranch: "main" },
@@ -136,7 +140,7 @@ describe("D1 session index repositories", () => {
     const store = new SessionIndexStore(env.DB);
     await store.create(makeEntry("scalar-1"));
 
-    const { sessions } = await store.list();
+    const { sessions } = await store.list({ readScope: internal, mode: "on" });
     expect(sessions).toHaveLength(1);
     expect(sessions[0].repositories).toBeUndefined();
   });
@@ -161,11 +165,14 @@ describe("D1 session index repositories", () => {
 });
 
 describe("POST /sessions repository list validation", () => {
-  beforeEach(cleanD1Tables);
-
   // session-create requires a participant identity: sign as a bot with an
   // asserted actor (the userless web service credential is rejected, 403).
   const actorAuth = { service: "slack-bot", actor: "slack:U0123" } as const;
+
+  beforeEach(async () => {
+    await cleanD1Tables();
+    await enrollSlackActor(actorAuth.actor);
+  });
 
   it("rejects repositories combined with scalar repo fields", async () => {
     const res = await serviceFetch("https://test.local/sessions", {

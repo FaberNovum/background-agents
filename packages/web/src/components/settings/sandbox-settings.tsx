@@ -2,21 +2,24 @@
 
 import { useRepos } from "@/hooks/use-repos";
 import { useState } from "react";
-import { z } from "zod";
 import { Button } from "@/components/ui/button";
-import { ChevronDownIcon, CheckIcon, PlusIcon } from "@/components/ui/icons";
-import { Combobox } from "@/components/ui/combobox";
+import { ChevronDownIcon, PlusIcon } from "@/components/ui/icons";
+import { Combobox, FIELD_COMBOBOX_TRIGGER_CLASS } from "@/components/ui/combobox";
 import { Input } from "@/components/ui/input";
 import useSWR from "swr";
 import { browserApiFetch, type BrowserApiPath } from "@/lib/browser-api-fetch";
 import {
   DEFAULT_BUILD_TIMEOUT_SECONDS,
   DEFAULT_CODE_SERVER_PORT,
+  DEFAULT_MODAL_VM_CPU_CORES,
+  DEFAULT_MODAL_VM_MEMORY_MIB,
+  DEFAULT_MODAL_VM_CPU_LIMIT_CORES,
+  DEFAULT_MODAL_VM_MEMORY_LIMIT_MIB,
   DEFAULT_TERMINAL_PORT,
   DEFAULT_VNC_PORT,
   MAX_BUILD_TIMEOUT_SECONDS,
   MAX_TUNNEL_PORTS,
-  sandboxSettingsSchema,
+  sandboxSettingCapabilities,
   type SandboxSettings,
 } from "@open-inspect/shared/types/integrations";
 import { encodeRepositoryPathSegments } from "@open-inspect/shared/types/repositories";
@@ -25,63 +28,22 @@ import {
   MIN_FINAL_SNAPSHOT_BUFFER_MINUTES,
   MIN_SANDBOX_TIMEOUT_MINUTES,
 } from "./sandbox-timeout";
-import { resolveSandboxSettingsDraft, type SandboxSettingsDraft } from "./sandbox-settings-draft";
-import { SessionCostSettingsFields } from "./session-cost-settings-fields";
-import { useCurrentUserAuthorization } from "@/hooks/use-current-user-authorization";
 import {
-  getPublicSandboxProvider,
-  supportsConfigurableSandboxResources,
-  supportsConfigurableSandboxTimeout,
-} from "@/lib/sandbox-provider";
+  INHERIT_SANDBOX_SETTING,
+  resolveSandboxSettingsDraft,
+  type SandboxSettingsDraft,
+} from "./sandbox-settings-draft";
+import { SessionCostSettingsFields } from "./session-cost-settings-fields";
+import {
+  parseSandboxEnvironmentSettingsResponse,
+  parseSandboxGlobalSettingsResponse,
+  parseSandboxRepoSettingsResponse,
+} from "./sandbox-settings-schema";
+import { useCurrentUserAuthorization } from "@/hooks/use-current-user-authorization";
+import { getPublicSandboxProvider } from "@/lib/sandbox-provider";
+import { GlobalRepositoryComboboxOption } from "./global-repository-combobox-option";
 
 const GLOBAL_SCOPE = "__global__";
-
-export const sandboxGlobalSettingsResponseSchema = z.object({
-  integrationId: z.literal("sandbox"),
-  settings: z
-    .object({
-      defaults: sandboxSettingsSchema.optional(),
-      enabledRepos: z.array(z.string()).nullable().optional(),
-    })
-    .nullable(),
-});
-
-export type GlobalSettingsResponse = z.infer<typeof sandboxGlobalSettingsResponseSchema>;
-
-export const sandboxRepoSettingsResponseSchema = z.object({
-  integrationId: z.literal("sandbox"),
-  repo: z.string(),
-  settings: sandboxSettingsSchema.nullable(),
-});
-
-export type RepoSettingsResponse = z.infer<typeof sandboxRepoSettingsResponseSchema>;
-
-export const sandboxEnvironmentSettingsResponseSchema = z.object({
-  integrationId: z.literal("sandbox"),
-  environmentId: z.string(),
-  settings: sandboxSettingsSchema.nullable(),
-});
-
-export type EnvironmentSettingsResponse = z.infer<typeof sandboxEnvironmentSettingsResponseSchema>;
-
-export function parseSandboxGlobalSettingsResponse(
-  value: unknown
-): GlobalSettingsResponse | undefined {
-  const parsed = sandboxGlobalSettingsResponseSchema.safeParse(value);
-  return parsed.success ? parsed.data : undefined;
-}
-
-function parseSandboxRepoSettingsResponse(value: unknown): RepoSettingsResponse | undefined {
-  const parsed = sandboxRepoSettingsResponseSchema.safeParse(value);
-  return parsed.success ? parsed.data : undefined;
-}
-
-function parseSandboxEnvironmentSettingsResponse(
-  value: unknown
-): EnvironmentSettingsResponse | undefined {
-  const parsed = sandboxEnvironmentSettingsResponseSchema.safeParse(value);
-  return parsed.success ? parsed.data : undefined;
-}
 
 const fetcher = (url: BrowserApiPath) => browserApiFetch(url).then((r) => r.json());
 
@@ -182,14 +144,11 @@ export function SandboxSettingsEditor({
 }) {
   const { hasPermission } = useCurrentUserAuthorization();
   const sandboxProvider = getPublicSandboxProvider();
-  const configurableResources = supportsConfigurableSandboxResources();
-  const configurableTimeout = supportsConfigurableSandboxTimeout();
-  const hiddenFields = new Set<keyof SandboxSettings>();
-  if (!configurableResources) {
-    hiddenFields.add("cpuCores");
-    hiddenFields.add("memoryMib");
-  }
-  if (!configurableTimeout) hiddenFields.add("sandboxTimeoutMs");
+  const {
+    resources: configurableResources,
+    resourceLimits: configurableLimits,
+    timeout: configurableTimeout,
+  } = sandboxSettingCapabilities(sandboxProvider);
   const isGlobal = scope === "global";
   const canManage = hasPermission(
     scope === "global"
@@ -211,7 +170,7 @@ export function SandboxSettingsEditor({
     ownSettings,
     baseDefaults,
     draft,
-    hiddenFields,
+    provider: sandboxProvider,
   });
   const rows = values.tunnelPorts;
 
@@ -475,8 +434,15 @@ export function SandboxSettingsEditor({
         <fieldset className="min-w-0">
           <legend className="block text-sm font-medium text-foreground mb-1.5">Resources</legend>
           <p className="text-xs text-muted-foreground mb-2">
-            Reserve CPU and memory for each sandbox. Leave blank to use the provider&apos;s default
-            reservation.
+            Requests reserve CPU and memory for each sandbox. Leave blank to use the provider&apos;s
+            defaults.
+            {configurableLimits &&
+              " Limits cap usage and must be at least the corresponding request."}
+            {configurableLimits &&
+              !isGlobal &&
+              " Leave a limit blank for the provider default, or choose Inherit to follow the parent setting."}
+            {sandboxProvider === "modal-vm" &&
+              ` VM defaults: requests of ${DEFAULT_MODAL_VM_CPU_CORES} CPU cores and ${DEFAULT_MODAL_VM_MEMORY_MIB} MiB; limits of at least ${DEFAULT_MODAL_VM_CPU_LIMIT_CORES} CPU cores and ${DEFAULT_MODAL_VM_MEMORY_LIMIT_MIB} MiB, raised to match larger requests.`}
           </p>
           <div className="grid gap-3 max-w-sm sm:grid-cols-2">
             <div>
@@ -484,7 +450,7 @@ export function SandboxSettingsEditor({
                 htmlFor="sandbox-cpu-cores"
                 className="block text-xs font-medium text-muted-foreground mb-1"
               >
-                CPU cores
+                CPU request (cores)
               </label>
               <Input
                 id="sandbox-cpu-cores"
@@ -500,7 +466,7 @@ export function SandboxSettingsEditor({
                 htmlFor="sandbox-memory-mib"
                 className="block text-xs font-medium text-muted-foreground mb-1"
               >
-                Memory (MiB)
+                Memory request (MiB)
               </label>
               <Input
                 id="sandbox-memory-mib"
@@ -512,6 +478,65 @@ export function SandboxSettingsEditor({
                 placeholder="provider default"
               />
             </div>
+            {configurableLimits && (
+              <>
+                <div>
+                  <label
+                    htmlFor="sandbox-cpu-limit-cores"
+                    className="block text-xs font-medium text-muted-foreground mb-1"
+                  >
+                    CPU limit (cores)
+                  </label>
+                  <Input
+                    id="sandbox-cpu-limit-cores"
+                    type="text"
+                    inputMode="decimal"
+                    value={values.cpuLimitCores}
+                    onChange={(e) => updateField("cpuLimitCores", e.target.value)}
+                    placeholder="provider default"
+                  />
+                  {!isGlobal && (
+                    <Button
+                      type="button"
+                      variant="subtle"
+                      size="xs"
+                      aria-label="Inherit CPU limit"
+                      onClick={() => updateField("cpuLimitCores", INHERIT_SANDBOX_SETTING)}
+                    >
+                      Inherit
+                    </Button>
+                  )}
+                </div>
+                <div>
+                  <label
+                    htmlFor="sandbox-memory-limit-mib"
+                    className="block text-xs font-medium text-muted-foreground mb-1"
+                  >
+                    Memory limit (MiB)
+                  </label>
+                  <Input
+                    id="sandbox-memory-limit-mib"
+                    type="number"
+                    min={1}
+                    inputMode="numeric"
+                    value={values.memoryLimitMib}
+                    onChange={(e) => updateField("memoryLimitMib", e.target.value)}
+                    placeholder="provider default"
+                  />
+                  {!isGlobal && (
+                    <Button
+                      type="button"
+                      variant="subtle"
+                      size="xs"
+                      aria-label="Inherit memory limit"
+                      onClick={() => updateField("memoryLimitMib", INHERIT_SANDBOX_SETTING)}
+                    >
+                      Inherit
+                    </Button>
+                  )}
+                </div>
+              </>
+            )}
           </div>
         </fieldset>
       ) : (
@@ -670,26 +695,13 @@ export function SandboxSettingsPage() {
           direction="down"
           dropdownWidth="w-full max-w-sm"
           disabled={loadingRepos}
-          triggerClassName="w-full max-w-sm flex items-center justify-between px-3 py-2 text-sm border border-border bg-input text-foreground hover:border-foreground/30 disabled:opacity-50 disabled:cursor-not-allowed transition"
+          triggerClassName={FIELD_COMBOBOX_TRIGGER_CLASS}
           prependContent={({ select }) => (
-            <>
-              <button
-                type="button"
-                onClick={() => select(GLOBAL_SCOPE)}
-                className={`w-full flex items-center justify-between px-3 py-2 text-sm hover:bg-muted transition ${
-                  isGlobal ? "text-foreground" : "text-muted-foreground"
-                }`}
-              >
-                <div className="flex flex-col items-start text-left">
-                  <span className="font-medium">All Repositories (Global)</span>
-                  <span className="text-xs text-secondary-foreground">
-                    Shared across all repositories
-                  </span>
-                </div>
-                {isGlobal && <CheckIcon className="w-4 h-4 text-accent" />}
-              </button>
-              {repos.length > 0 && <div className="border-t border-border my-1" />}
-            </>
+            <GlobalRepositoryComboboxOption
+              selected={isGlobal}
+              onSelect={() => select(GLOBAL_SCOPE)}
+              showSeparator={repos.length > 0}
+            />
           )}
         >
           <span className="truncate">{displayRepoName}</span>

@@ -23,7 +23,7 @@ sign-in are supported, while GitHub App repository credentials remain required f
 
 Required:
 
-- Node.js `22+` (minimum supported: `20+`)
+- Node.js `24+`
 - npm
 - Git
 
@@ -205,12 +205,23 @@ For full infrastructure setup, use:
 
 Critical notes before deploy:
 
+- After [Owner bootstrap](GETTING_STARTED.md#step-9-bootstrap-the-workspace-owner),
+  [create the first team](GETTING_STARTED.md#step-10-create-the-first-team-and-test-a-session). The
+  creator becomes Lead; choose membership policy and default visibility, grant repositories,
+  join/add operators, and create a team-owned test session.
+- Fresh deployments should explicitly set `teams_enforcement = "on"` in Terraform to deploy
+  `TEAMS_ENFORCEMENT=on`. Runtime and Terraform defaults remain `shadow`. Existing deployments must
+  review production `shadow_denied:*` authorization audit entries before opting in; no completed
+  default-flip audit gate is established by this guide.
 - Build workers before running Terraform apply.
 - Build `@open-inspect/shared` first.
 - Use two-phase Terraform deploy for DO/service bindings.
 - For Modal deployments, eagerly build the Sandbox image with
   `uv run python deploy.py --build-sandbox-image`, then deploy with `uv run modal deploy deploy.py`
   (not `src/app.py`).
+- Modal's legacy `github-app` secret is not required for fresh or restored sandbox Git credentials;
+  keep the App private key in the control plane (and the GitHub bot's own bindings when enabled).
+  Retain the required Modal `llm-api-keys` and `internal-api` secret objects.
 - Existing sessions keep their pinned authentication. Remove legacy OAuth keys only after dependent
   legacy-bound sessions are no longer needed.
 
@@ -225,7 +236,8 @@ Your GitHub callback URL does not exactly match the running app URL.
 Check `allowed_users`, `allowed_email_domains`, `allowed_emails`, and `allowed_github_orgs` in the
 control plane's Terraform configuration. If `allowed_github_orgs` is set, make sure your GitHub App
 has Organization permissions: Members read-only and that the updated permission was republished and
-approved for the installation.
+approved for the installation. Owners and Administrators can also add the person under **Settings >
+Workspace access > Who can sign in**; those rules add to the Terraform lists.
 
 ### Web can load, but session APIs return 401
 

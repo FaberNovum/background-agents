@@ -19,7 +19,9 @@ import {
   NO_AUTHORIZATION,
   SCM_AGNOSTIC_HANDLER_AUTHENTICATED_ROUTE,
 } from "../routes/shared";
-import { Scheduler } from "../scheduler/scheduler";
+import { SessionFollowUpRefusedError } from "../scheduler/contracts";
+import { createScheduler } from "../scheduler/factory";
+import { followUpRefusedResponse } from "./automation-webhook";
 import type { Env } from "../types";
 
 const MAX_PAYLOAD_SIZE = 256 * 1024;
@@ -100,9 +102,18 @@ async function handleMarkerWebhook(
     return error("Invalid JSON body", 400);
   }
 
-  const event = normalizeWebhookEvent(params.id, body, parseMarkerIdempotencyKey(body));
-  const result = await new Scheduler(ctx.db, env, ctx.executionCtx).event(event);
-  return json({ ok: true, ...result });
+  const event = normalizeWebhookEvent(params.id, body, {
+    idempotencyKey: parseMarkerIdempotencyKey(body),
+  });
+  let result;
+  try {
+    result = await createScheduler(ctx.db, env, ctx.executionCtx).event(event);
+  } catch (e) {
+    if (e instanceof SessionFollowUpRefusedError) return followUpRefusedResponse(e);
+    throw e;
+  }
+  const { invocationIds, ...counts } = result;
+  return json({ ok: true, ...counts, invocationId: invocationIds[0] ?? null });
 }
 
 export const markerWebhookRoutes = new Hono<ControlPlaneHonoEnv>();
