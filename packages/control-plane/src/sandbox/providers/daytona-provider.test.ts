@@ -7,6 +7,7 @@
 
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { computeHmacHex } from "@open-inspect/shared/auth";
+import { DEFAULT_TERMINAL_PORT } from "@open-inspect/shared/types/integrations";
 import { deriveVncPassword } from "../sandbox-env";
 import { DaytonaSandboxProvider, type DaytonaProviderConfig } from "./daytona-provider";
 import {
@@ -32,8 +33,6 @@ const defaultRestConfig: DaytonaRestConfig = {
   apiUrl: "https://daytona.test/api",
   apiKey: "test-api-key",
   baseSnapshot: "base-snapshot-v1",
-  autoStopIntervalMinutes: 120,
-  autoArchiveIntervalMinutes: 10080,
 };
 
 function createMockClient(
@@ -59,27 +58,21 @@ function createMockClient(
       if (!config.baseSnapshot) throw new Error("DAYTONA_BASE_SNAPSHOT is required");
       return config.baseSnapshot;
     }),
-    createSandbox: vi.fn(
-      async (): Promise<DaytonaSandboxResponse> => ({
-        id: "daytona-sandbox-id",
-        state: "started",
-      })
-    ),
-    getSandbox: vi.fn(
-      async (): Promise<DaytonaSandboxResponse> => ({
-        id: "daytona-sandbox-id",
-        state: "started",
-      })
-    ),
+    createSandbox: vi.fn(async (): Promise<DaytonaSandboxResponse> => ({
+      id: "daytona-sandbox-id",
+      state: "started",
+    })),
+    getSandbox: vi.fn(async (): Promise<DaytonaSandboxResponse> => ({
+      id: "daytona-sandbox-id",
+      state: "started",
+    })),
     startSandbox: vi.fn(async () => {}),
     stopSandbox: vi.fn(async () => {}),
     deleteSandbox: vi.fn(async () => {}),
     recoverSandbox: vi.fn(async () => {}),
-    getSignedPreviewUrl: vi.fn(
-      async (): Promise<DaytonaSignedPreviewUrlResponse> => ({
-        url: "https://preview.test/signed",
-      })
-    ),
+    getSignedPreviewUrl: vi.fn(async (): Promise<DaytonaSignedPreviewUrlResponse> => ({
+      url: "https://preview.test/signed",
+    })),
     ...overrides,
   } as unknown as DaytonaRestClient;
 }
@@ -87,6 +80,8 @@ function createMockClient(
 const defaultProviderConfig: DaytonaProviderConfig = {
   scmProvider: "github",
   sandboxAccessPasswordSecret: "test-secret-key",
+  autoStopIntervalMinutes: 120,
+  autoArchiveIntervalMinutes: 10080,
 };
 
 const baseCreateConfig: CreateSandboxConfig = {
@@ -193,6 +188,7 @@ describe("DaytonaSandboxProvider", () => {
     it("assembles env vars correctly for GitLab", async () => {
       const client = createMockClient();
       const provider = new DaytonaSandboxProvider(client, {
+        ...defaultProviderConfig,
         scmProvider: "gitlab",
         gitlabAccessToken: "glpat-test-token",
         sandboxAccessPasswordSecret: "secret",
@@ -212,6 +208,7 @@ describe("DaytonaSandboxProvider", () => {
       // it now resolves the real Bitbucket identity like every provider.
       const client = createMockClient();
       const provider = new DaytonaSandboxProvider(client, {
+        ...defaultProviderConfig,
         scmProvider: "bitbucket",
         sandboxAccessPasswordSecret: "secret",
       });
@@ -461,6 +458,7 @@ describe("DaytonaSandboxProvider", () => {
       expect(result.success).toBe(true);
       expect(result.providerObjectId).toBe("daytona-sandbox-id");
       expect(client.startSandbox).toHaveBeenCalledWith("daytona-sandbox-id");
+      expect(client.getSignedPreviewUrl).not.toHaveBeenCalled();
     });
 
     it("returns shouldSpawnFresh when sandbox not found", async () => {
@@ -735,7 +733,10 @@ describe("DaytonaSandboxProvider prebuilt images", () => {
       url: "https://preview.test/signed",
     }));
 
-    await prebuiltProvider(client).createSandbox(prebuiltConfig);
+    const result = await prebuiltProvider(client).createSandbox({
+      ...prebuiltConfig,
+      sandboxSettings: { terminalEnabled: true },
+    });
 
     const params = client.createSandbox.mock.calls[0][0];
     expect(params.snapshot).toBe("snapshot-1");
@@ -745,7 +746,10 @@ describe("DaytonaSandboxProvider prebuilt images", () => {
       IMAGE_BUILD_MODE: "false",
       RESTORED_FROM_SNAPSHOT: "false",
       OI_DEFERRED_START: "false",
+      TERMINAL_ENABLED: "true",
+      TTYD_PROXY_PORT: String(DEFAULT_TERMINAL_PORT),
     });
+    expect(result.ttydUrl).toBe("https://preview.test/signed");
     // Presence of any callback key is what the runtime reads as a build
     // context, so a session create must set none of them.
     for (const key of Object.keys(params.env ?? {})) {
@@ -994,6 +998,6 @@ describe("DaytonaSandboxProvider prebuilt images", () => {
     expect(result.vncAccess).toBeUndefined();
     expect(result.tunnelUrls).toBeUndefined();
     expect(client.deleteSandbox).not.toHaveBeenCalled();
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining("daytona.create_tunnel_urls_failed"));
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("daytona.preview_url_failed"));
   });
 });

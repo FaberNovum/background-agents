@@ -1,41 +1,56 @@
 import {
   BUILT_IN_ROLE_REGISTRY,
+  builtInRoleKeySchema,
   roleReferenceSchema,
   type BuiltInRoleKey,
   type PermissionId,
   type RoleReference,
   type WorkspaceMember,
+  workspaceMemberSchema,
 } from "@open-inspect/shared/rbac";
+import type { AuditOperationAction } from "@open-inspect/shared/types/audit-events";
+import { z } from "zod";
 import { rolePermissionPredicate } from "../authorization/permission-sql";
 import type { SqlDatabase, SqlStatement } from "./sql-database";
 
 const OWNER_ROLE_ID = BUILT_IN_ROLE_REGISTRY.owner.id;
 
-interface EffectiveRow {
-  user_id: string;
-  suspended_at: number | null;
-  role_id: string | null;
-  role_key: BuiltInRoleKey | null;
-  role_name: string | null;
-}
+const effectiveRowSchema = z.object({
+  user_id: z.string(),
+  suspended_at: z.number().nullable(),
+  role_id: z.string().nullable(),
+  role_key: builtInRoleKeySchema.nullable(),
+  role_name: z.string().nullable(),
+});
 
-interface RoleRow {
-  id: string;
-  key: BuiltInRoleKey | null;
-  name: string;
-  description: string | null;
-  assignment_count: number;
-}
+type EffectiveRow = z.infer<typeof effectiveRowSchema>;
 
-interface MemberRow {
-  user_id: string;
-  display_name: string | null;
-  email: string | null;
-  suspended_at: number | null;
-  role_id: string;
-  role_key: BuiltInRoleKey | null;
-  role_name: string;
-}
+const countValueSchema = z
+  .union([z.number(), z.string().regex(/^\d+$/)])
+  .transform((value) => Number(value))
+  .pipe(z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER));
+
+const roleRowSchema = z.object({
+  id: z.string(),
+  key: builtInRoleKeySchema.nullable(),
+  name: z.string(),
+  description: z.string().nullable(),
+  assignment_count: countValueSchema,
+});
+
+type RoleRow = z.infer<typeof roleRowSchema>;
+
+const memberRowSchema = z.object({
+  user_id: z.string(),
+  display_name: z.string().nullable(),
+  email: z.string().nullable(),
+  suspended_at: z.number().nullable(),
+  role_id: z.string(),
+  role_key: builtInRoleKeySchema.nullable(),
+  role_name: z.string(),
+});
+
+type MemberRow = z.infer<typeof memberRowSchema>;
 
 /** Persistence view of a user's assignment and suspension state before grants are resolved. */
 export interface EffectiveAuthorizationRecord {
@@ -53,7 +68,7 @@ export type AuthorizationRoleRecord = RoleReference & {
 interface AuditInput {
   requestId: string;
   actorUserId: string;
-  action: string;
+  action: AuditOperationAction;
   resourceType: string;
   resourceId?: string | null;
   targetUserId?: string | null;
@@ -119,6 +134,24 @@ function toEffectiveAuthorizationRecord(row: EffectiveRow): EffectiveAuthorizati
   };
 }
 
+function parseEffectiveRow(row: unknown): EffectiveRow {
+  const parsed = effectiveRowSchema.safeParse(row);
+  if (parsed.success) return parsed.data;
+  throw new Error("Malformed persisted authorization row");
+}
+
+function parseRoleRow(row: unknown): RoleRow {
+  const parsed = roleRowSchema.safeParse(row);
+  if (parsed.success) return parsed.data;
+  throw new Error("Malformed persisted authorization role row");
+}
+
+function parseMemberRow(row: unknown): MemberRow {
+  const parsed = memberRowSchema.safeParse(row);
+  if (parsed.success) return parsed.data;
+  throw new Error("Malformed persisted authorization member row");
+}
+
 function toRoleRecord(row: RoleRow): AuthorizationRoleRecord {
   return {
     ...toRoleReference(row.id, row.key, row.name),
@@ -128,13 +161,15 @@ function toRoleRecord(row: RoleRow): AuthorizationRoleRecord {
 }
 
 function toMember(row: MemberRow): WorkspaceMember {
-  return {
+  const parsed = workspaceMemberSchema.safeParse({
     userId: row.user_id,
     displayName: row.display_name,
     email: row.email,
     suspendedAt: row.suspended_at,
     role: toRoleReference(row.role_id, row.role_key, row.role_name),
-  };
+  });
+  if (parsed.success) return parsed.data;
+  throw new Error("Malformed persisted authorization member row");
 }
 
 /** Persists RBAC reads and authorization-guarded, audited member mutations. */
@@ -154,8 +189,8 @@ export class AuthorizationStore {
          WHERE u.id = ?`
       )
       .bind(userId)
-      .first<EffectiveRow>();
-    return row ? toEffectiveAuthorizationRecord(row) : null;
+      .first<unknown>();
+    return row ? toEffectiveAuthorizationRecord(parseEffectiveRow(row)) : null;
   }
 
   /** Loads raw custom-role grants for policy-layer validation against the registry. */
@@ -180,8 +215,8 @@ export class AuthorizationStore {
          GROUP BY r.id
          ORDER BY r.is_system DESC, r.normalized_name ASC`
       )
-      .all<RoleRow>();
-    return result.results.map(toRoleRecord);
+      .all<unknown>();
+    return result.results.map((row) => toRoleRecord(parseRoleRow(row)));
   }
 
   /** Loads a role and its assignment count, or null when absent. */
@@ -195,8 +230,8 @@ export class AuthorizationStore {
          WHERE r.id = ? GROUP BY r.id`
       )
       .bind(roleId)
-      .first<RoleRow>();
-    return row ? toRoleRecord(row) : null;
+      .first<unknown>();
+    return row ? toRoleRecord(parseRoleRow(row)) : null;
   }
 
   /** Lists users with role assignments; unassigned users are intentionally excluded. */
@@ -210,8 +245,24 @@ export class AuthorizationStore {
          JOIN roles r ON r.id = ura.role_id
          ORDER BY COALESCE(u.display_name, u.email, u.id) COLLATE NOCASE`
       )
-      .all<MemberRow>();
-    return result.results.map(toMember);
+      .all<unknown>();
+    return result.results.map((row) => toMember(parseMemberRow(row)));
+  }
+
+  /** Loads one assigned member, or null when the user is absent or unassigned. */
+  async getMember(userId: string): Promise<WorkspaceMember | null> {
+    const row = await this.db
+      .prepare(
+        `SELECT u.id AS user_id, u.display_name, u.email, u.suspended_at,
+                r.id AS role_id, r.key AS role_key, r.name AS role_name
+         FROM users u
+         JOIN user_role_assignments ura ON ura.user_id = u.id
+         JOIN roles r ON r.id = ura.role_id
+         WHERE u.id = ?`
+      )
+      .bind(userId)
+      .first<MemberRow>();
+    return row ? toMember(row) : null;
   }
 
   /** Atomically revalidates the actor, preserves owner invariants, updates the role, and audits. */

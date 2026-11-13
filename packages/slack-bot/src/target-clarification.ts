@@ -75,6 +75,19 @@ export function parseTargetInteractionRequestId(
   return REQUEST_ID_PATTERN.test(requestId) ? requestId : null;
 }
 
+/**
+ * True when a block id was minted by this module, whichever control it came
+ * from. A click on such a block must carry a parseable request id; a block id
+ * this code never produced belongs to a control posted before request ids
+ * existed, and its selection still resolves by channel and thread.
+ */
+export function isTargetInteractionBlockId(blockId: string): boolean {
+  return (
+    blockId.startsWith(TARGET_PICKER_BLOCK_ID_PREFIX) ||
+    blockId.startsWith(TARGET_QUICK_PICK_BLOCK_ID_PREFIX)
+  );
+}
+
 /** Unique per-button action_id; Slack requires action_id uniqueness within an actions block. */
 export function quickPickActionId(index: number): string {
   return `${SELECT_TARGET_QUICK_PICK_ACTION_ID}:${index}`;
@@ -151,17 +164,25 @@ function filterEnvironmentsByQuery(
 export async function resolveTargetValue(
   env: Env,
   value: string,
-  traceId?: string
+  traceId?: string,
+  channelId?: string | null,
+  userId?: string
 ): Promise<SlackSessionTarget | null> {
   const ref = parseTargetValue(value);
   if (ref.kind === "none") {
     return { kind: "none" };
   }
   if (ref.kind === "environment") {
-    const environment = await getEnvironmentById(env, ref.environmentId, traceId);
+    const environment = await getEnvironmentById(
+      env,
+      ref.environmentId,
+      traceId,
+      channelId,
+      userId
+    );
     return environment ? { kind: "environment", environment } : null;
   }
-  const repos = await getAvailableRepos(env, traceId);
+  const repos = await getAvailableRepos(env, traceId, channelId, userId);
   const repo = repos.find((r) => r.id === ref.repoId);
   return repo ? { kind: "repository", repo } : null;
 }
@@ -172,8 +193,7 @@ export async function resolveTargetValue(
  * exactly one of the two shapes).
  */
 export type TargetClarificationOptions =
-  | { options: SlackSelectOption[] }
-  | { option_groups: SlackSelectOptionGroup[] };
+  { options: SlackSelectOption[] } | { option_groups: SlackSelectOptionGroup[] };
 
 /** Number of options in either response shape (for logging). */
 export function countClarificationOptions(response: TargetClarificationOptions): number {
@@ -227,9 +247,11 @@ function buildGroupedOptions(
 export async function getTargetClarificationOptions(
   env: Env,
   query: string | undefined,
-  traceId?: string
+  traceId?: string,
+  channelId?: string | null,
+  userId?: string
 ): Promise<TargetClarificationOptions> {
-  const catalog = await loadTargetCatalog(env, traceId);
+  const catalog = await loadTargetCatalog(env, traceId, channelId, userId);
   const remainingAfterNoRepository = MAX_REPO_SUGGESTION_OPTIONS - 1;
   const matchedEnvironments = filterEnvironmentsByQuery(catalog.environments, query).slice(
     0,

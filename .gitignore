@@ -17,6 +17,7 @@ venv/
 dist/
 build/
 .next/
+packages/web/public/mermaid-renderer.html
 out/
 
 # IDE
@@ -43,7 +44,13 @@ yarn-debug.log*
 yarn-error.log*
 
 # Test
+.preview/
+playwright-report/
+test-results/
 coverage/
+.vitest-reports/
+.coverage
+.coverage.*
 .nyc_output/
 
 # Cloudflare
@@ -105,3 +112,6 @@ terraform/environments/aws-staging/plan.out
 terraform/environments/aws-production/plan.out
 
 # Stable local advisory-lock inode for sandbox release selection writers.
+
+# Loopback-only managed MCP canary bundle.
+scripts/managed-mcp/.example-server.mjs

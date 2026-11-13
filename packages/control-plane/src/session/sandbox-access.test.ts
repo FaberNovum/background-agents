@@ -88,7 +88,30 @@ describe("resolveSandboxDashboardUrl", () => {
     );
   });
 
-  it("returns null for every non-Modal backend", () => {
+  it("does not link a pending VM reference to the Modal dashboard", () => {
+    const vm = { ...modal, sandboxProvider: "modal-vm" };
+    expect(resolveSandboxDashboardUrl(vm, 'modal-vm-session:["session","sandbox"]')).toBeNull();
+    expect(resolveSandboxDashboardUrl(vm, "sb-123")).toContain("sandboxId=sb-123");
+  });
+
+  it("builds a Boat dashboard URL selecting the sandbox, without Modal settings", () => {
+    const boat = {
+      sandboxProvider: "boat",
+      modalWorkspace: undefined,
+      modalEnvironment: undefined,
+    };
+    expect(resolveSandboxDashboardUrl(boat, "sbx_A1-b2")).toBe(
+      "https://boat.dev/dashboard?tab=sandboxes&sandbox=sbx_A1-b2"
+    );
+    expect(resolveSandboxDashboardUrl(boat, "a b&c")).toBe(
+      "https://boat.dev/dashboard?tab=sandboxes&sandbox=a%20b%26c"
+    );
+    expect(resolveSandboxDashboardUrl(boat, null)).toBeNull();
+    expect(resolveSandboxDashboardUrl(boat, undefined)).toBeNull();
+    expect(resolveSandboxDashboardUrl(boat, "")).toBeNull();
+  });
+
+  it("returns null for backends without a dashboard link", () => {
     expect(resolveSandboxDashboardUrl({ ...modal, sandboxProvider: "e2b" }, "sb-123")).toBeNull();
     expect(
       resolveSandboxDashboardUrl({ ...modal, sandboxProvider: "daytona" }, "sb-123")

@@ -5,10 +5,9 @@ the same Slack thread, set personal defaults in App Home, and ask agents to post
 that workflow is enabled.
 
 This guide is for people using the Slack integration day to day. If you are installing the Slack app
-or deploying the worker, start with
-[Getting Started](../GETTING_STARTED.md#step-4-create-slack-app-optional) and
-[Complete Slack Setup](../GETTING_STARTED.md#step-7b-complete-slack-setup-if-using-slack). Optional
-notification controls and safety notes are covered near the end.
+or deploying the worker, start with [Getting Started](../GETTING_STARTED.md#create-the-slack-app)
+and [Complete Slack Setup](../GETTING_STARTED.md#complete-slack-setup). Optional notification
+controls and safety notes are covered near the end.
 
 ---
 
@@ -72,12 +71,15 @@ repository name when the request could apply to more than one repo:
 @Open-Inspect update the billing docs in acme/api
 ```
 
-Open-Inspect chooses from repositories and environments available to this deployment, using the
+Open-Inspect chooses from repositories and environments available in the channel's scope, using the
 message, Slack channel context, and recent thread context. A configured
 [routing-rule keyword](#routing-rules) takes precedence, followed by a single channel association.
 Otherwise the classifier chooses the best target for the request, including **No repository** when
 the task does not require a codebase. When the match is unclear, Open-Inspect asks you to choose a
 repository, environment, or **No repository** in the Slack thread.
+
+Channel-started sessions never include personal memories, because their replies post where others
+read them. Repository and environment memories still apply.
 
 ### From a DM
 
@@ -89,6 +91,11 @@ Can you investigate the flaky login test in acme/web?
 
 DMs do not need an `@mention`. If you include one anyway, Open-Inspect strips it before sending the
 request to the agent.
+
+A DM-started session uses your personal memories as a web session does: the bot marks its create
+request `directMessage` (Slack conversation IDs starting with `D`), and the control plane applies
+your saved preference. See
+[Personal memory follows the owner's prompts](../MEMORY.md#personal-memory-follows-the-owners-prompts).
 
 ### Model and reasoning overrides
 
@@ -114,6 +121,18 @@ new session in a new thread.
 Both flags accept a space or colon before their value, such as `!model:openai/gpt-5.6-sol` and
 `!reasoning:high`. Any flags must appear together at the start of the request. Models must be
 enabled under **Settings > Models**, and reasoning values must be supported by the selected model.
+
+When your [agent harness](#default-model-and-agent-harness) is Claude Agent, a session-starting
+`!model` that Claude Agent cannot run, such as `!model openai/gpt-5.4`, is refused and no session
+starts. A follow-up stays on the thread's harness, so the control plane rejects a follow-up `!model`
+that the harness cannot run. The bot replies in the thread:
+
+> Model "openai/gpt-5.4" cannot run on the Claude Agent harness. A thread keeps the harness its
+> session started on. Reply without `!model`, or start a new thread to use that model.
+
+A `!reasoning`-only follow-up keeps the thread's session model, as a follow-up without flags does,
+even if an administrator has since disabled that model. The thread's harness was chosen to run that
+model, so the follow-up always runs.
 
 To continue a session that started from a DM, reply in the Slack thread created for that DM request.
 Sending a new top-level DM is treated as a new request and may start repository selection again.
@@ -165,6 +184,10 @@ They show accessible repositories and environments plus **No repository**, which
 empty sandbox. Open-Inspect keeps the original request for one hour; after a target is selected, the
 session starts with that original request and thread context.
 
+The planned model is rechecked before launch. If it was disabled while the request was pending, the
+bot refuses to start a session rather than substituting another model. Send a new request with an
+enabled model.
+
 In shared channels, only the original requester can choose the target. If the dropdown has expired,
 send the request again and name the repository, environment, or that no repository is needed.
 
@@ -204,6 +227,63 @@ conventions. They apply to new sessions only (thread follow-ups continue with th
 context), are limited to 10,000 characters, and mirror the Linear integration's **Issue Session
 Instructions**.
 
+### Default model and agent harness
+
+Administrators set two workspace-wide defaults for new Slack sessions under **Settings >
+Integrations > Slack**:
+
+| Setting       | What it controls                                                                    |
+| ------------- | ----------------------------------------------------------------------------------- |
+| Default model | The model for users who have not chosen one in App Home; unset uses `DEFAULT_MODEL` |
+| Agent harness | OpenCode (default) or Claude Agent for users who have not chosen one in App Home    |
+
+A new session runs on the requester's App Home **Agent harness**, or on the workspace **Agent
+harness** when the requester has not chosen one. Model selection for a new session uses this
+priority, highest to lowest:
+
+1. `!model` and `!reasoning` flags on the request that starts the session.
+2. The requester's App Home model and reasoning effort.
+3. The Slack **Default model**.
+4. Deployment default model (`DEFAULT_MODEL`).
+
+The effective model must be enabled under **Settings > Models**. If the App Home model, Slack
+**Default model**, or deployment/system default used by the request is disabled, the bot refuses to
+start a new session. It never substitutes a lower-priority default or the first enabled model.
+Re-enable the model or update the applicable preference or default. An enabled App Home model or
+leading `!model` override still works when a lower-priority default is disabled, provided the
+session's harness can run it. Existing-thread follow-ups without `!model` keep the session's model,
+even if it has since been disabled.
+
+If the session's harness cannot run the resolved model, the bot starts no session. Claude Agent runs
+Anthropic models only, so an OpenAI App Home model or `!model openai/gpt-5.4` is refused on Claude
+Agent. After its "Starting work..." message, the bot replies in the thread:
+
+> Model "openai/gpt-5.4" cannot run on the Claude Agent harness. Start your request with `!model`
+> and a model Claude Agent can run, or change your model or agent harness in the Slack app's Home
+> tab.
+
+The settings form lists only models the selected harness can run and rejects saving a harness with a
+model it cannot run. When the workspace **Agent harness** is Claude Agent, a **Default model** is
+required: the form disables **Save** and says "Choose a default model Claude Agent can run." until
+one is chosen, and the control plane rejects saving Claude Agent without one. "Use system default"
+is not offered for Claude Agent, because the settings page cannot see the deployment default model,
+which may be one Claude Agent cannot run.
+
+A harness change applies to new sessions. Each thread keeps the harness its session started on. If
+the bot cannot read the Slack settings, App Home may show OpenCode as the workspace-harness display
+fallback without changing the user's saved App Home harness. This does not permit a new launch: new
+session requests are refused until Slack settings are available.
+
+Slack sessions are unattended, so on Claude Agent they follow the default Claude account's
+**Automated authentication** policy and may use a connected Claude account. This applies when a user
+picks Claude Agent in App Home too, even if the workspace harness is OpenCode. Set **Automated
+authentication** to **No account (API key)** to keep Slack sessions on `ANTHROPIC_API_KEY`. The
+session also loads the repository's `CLAUDE.md` and `.claude/` settings and hooks, and code the
+agent runs inherits the Anthropic credential, so let Slack reach only repositories whose `.claude/`
+configuration you trust. A repository's first Claude Agent sessions can start without its prebuilt
+image if that image predates the Claude image floor. See
+[Claude Agent](../CLAUDE_AGENT.md#slack-sessions).
+
 ---
 
 ## Threaded Conversations
@@ -212,13 +292,66 @@ A top-level Slack request starts a new Slack thread. Reply in that thread to sen
 to the same Open-Inspect session. This applies in both channels and DMs: in a direct message, the
 follow-up still needs to be a thread reply, not a fresh top-level DM.
 
-Image attachments on interactive channel follow-ups must accompany an `@mention` of the bot. In a DM
-thread, no mention is needed. Watched-channel automation threads are text-only, as described in
-[Channel Message Triggers](#channel-message-triggers).
+In a channel thread, a follow-up and its images need an `@mention` of the bot, unless the thread is
+a [solo thread](#solo-threads). In a DM thread, no mention is needed. Watched-channel automation
+threads are text-only, as described in [Channel Message Triggers](#channel-message-triggers).
+
+### Solo threads
+
+A channel thread becomes a solo thread when your `@mention` of the bot starts its session and the
+bot's acknowledgement says: "You can reply without mentioning me while you are the only person in
+this thread." The bot adds that line only when it reads the thread as the session starts and finds
+that only you and bots have posted. In a solo thread, your replies send an instruction to this
+session without an `@mention`, including replies with images or forwarded messages.
+
+| Thread                                                     | Does a reply need an `@mention` to send an instruction? |
+| ---------------------------------------------------------- | ------------------------------------------------------- |
+| Solo thread, reply from the person who started the session | No                                                      |
+| Another person has posted in the thread                    | Yes, for everyone, from then on                         |
+| Another person posted before the session started           | Yes; the acknowledgement has no solo line               |
+| DM thread                                                  | No                                                      |
+
+The bot reads the thread when the session starts, after any target choice, so a person who replied
+before then counts, even in a thread your mention started. When the bot notices another person in a
+solo thread, from their post or from the thread it reads for your next unmentioned reply, it posts a
+message in the thread for everyone: "This thread now has multiple people. From now on, mention @bot
+to send an instruction to this session." In rare cases, such as two people posting at the same
+moment, that message can appear twice. The thread then needs an `@mention` for the rest of its life,
+even if that person deletes their message. Other bots and Slackbot do not count as people.
+
+An unmentioned reply sends an instruction to the session only when all of these hold:
+
+- The thread has an open session. An unmentioned reply never starts a session.
+- The reply has something to run: text, an image, or a forwarded message. A reply with only flags or
+  only a file that is not an image is not sent.
+- The reply does not open by mentioning a teammate, as in `@alice can you check this?`.
+- The reply is a new message. Edits and replies also sent to the channel are not sent.
+- The bot can read the whole thread from Slack and sees no other person in it. The bot reads the
+  thread on every unmentioned reply. If Slack does not return the whole thread, the reply is not
+  sent.
+
+A reply that is sent gets the same :eyes: reaction as a mentioned follow-up and works the same way:
+`!model` and `!reasoning` apply, and delivery problems are reported in the thread. It does not also
+run channel message triggers. A reply that is not sent gets no response from the bot, except the
+message above when the thread shows another person, or the error for a malformed `!model` or
+`!reasoning` flag. It can still reach the session as thread context with your next instruction, and
+it can still match a [channel message trigger](#channel-message-triggers).
+
+Solo threads use the `message.channels` and `message.groups` event subscriptions and the
+`channels:history` and `groups:history` scopes that the bundled app manifest already includes. A
+thread stays solo for about 7 days after its session starts; after that, mention the bot again.
 
 Open-Inspect keeps the Slack thread connected to the session for about 7 days. If you reply after
 that mapping expires, or if you reply outside the thread, the bot may start target selection again
 and create a new session.
+
+An existing mapping is not replaced merely because a follow-up fails. If the session is missing or
+no longer publishable in this channel, the bot reports that the thread is closed; start a new
+request in a new thread. A follow-up 404 triggers a separate publication check: the mapping is
+marked closed only when that check confirms denial. An actor-specific 403 leaves the mapping usable
+by other authorized people, and an actor-concealed 404 does not close it for everyone when channel
+publication is still allowed. Binding changes are checked on each mapped follow-up. A closed mapping
+can reopen if its original team binding matches again and publication is allowed.
 
 For follow-ups, Open-Inspect includes up to ten recent thread messages posted after the preceding
 prompt and strictly before the new request. Replies that arrive while Slack history is being fetched
@@ -239,10 +372,12 @@ The web session is the best place to watch live output, inspect files, or take o
 
 When the agent finishes, Slack receives a completion reply with:
 
-- The agent's final response, shortened if it is too long for Slack
+- The agent's final response, rendered as Markdown (headings, lists, links, tables) and shortened if
+  it is too long for Slack. Broadcast mentions such as `@here` and `@channel` are removed.
 - Created artifacts such as pull requests or branches
 - A few key tool actions, such as edits or commands
 - The final status, model, session target, and reasoning effort when available
+- Any personal MCP server warnings for the prompt, with a **Your MCP Connections** button
 - A **View Session** button
 
 If the agent created a manual-PR branch and no PR artifact is already present, Slack may also show a
@@ -258,13 +393,20 @@ Slack sessions.
 
 | Setting          | What it controls                                                             |
 | ---------------- | ---------------------------------------------------------------------------- |
+| Agent harness    | Workspace default, OpenCode, or Claude Agent for your new Slack sessions     |
 | Model            | The model used when you start a new session from Slack                       |
 | Reasoning effort | The reasoning depth, shown for models that support reasoning effort controls |
 | Branch           | A global branch override for new Slack sessions                              |
 | Branch by repo   | A branch override for one repository, shown when repositories are available  |
 
-The selector normally uses models enabled in **Settings > Models** in the web app. If Slack cannot
-load that list, it falls back to the default enabled models.
+The selector uses models enabled in **Settings > Models** in the web app. If Slack cannot load that
+list, Home shows a temporary-unavailability notice and preserves your configured model and reasoning
+without treating the model as disabled. It lists only models your agent harness can run. If
+compatible enabled models are available but your current model is disabled or incompatible, the
+selector shows "Choose a model" with no selection and a refusal note. If no enabled model can run on
+the selected harness, Home shows a message instead of a selector, asking you to choose another
+harness or have an admin enable a compatible model. The "Currently using" summary names your model
+and agent harness, or marks the model as needing replacement.
 
 Branch preference priority is:
 
@@ -275,15 +417,16 @@ Branch preference priority is:
 These preferences are per Slack user. They affect new Slack sessions; follow-ups in an existing
 Slack thread continue the existing session. A leading `!model` or `!reasoning` flag overrides the
 corresponding setting for the session it starts, or for a single follow-up request, without changing
-these preferences.
+these preferences. Without an App Home model or agent harness, new sessions use the workspace
+[default model and agent harness](#default-model-and-agent-harness).
 
 ---
 
 ## Optional Agent Notifications
 
-Interactive Slack sessions (DMs and `@mentions`) always get their normal thread replies and
-completion messages. Agent notifications are separate: they let an agent post an extra message to a
-Slack channel when you explicitly ask for it:
+Interactive Slack sessions (DMs and `@mentions`) get normal thread replies and completion messages
+only while publication is allowed. Agent notifications are separate: they let an agent post an extra
+message to a Slack channel when you explicitly ask for it:
 
 ```text
 When you finish, post a short summary to #eng-updates.
@@ -297,9 +440,12 @@ To use this workflow:
 4. Optional: add repository overrides to inherit, force on, or force off agent notifications for
    specific repositories.
 
-Channel membership controls where these extra posts can go. Invite the bot to a channel to make it
-available; remove it from a channel to remove access. Slack may still reject missing, archived,
-inaccessible, or rate-limited targets.
+Bot membership is necessary, but is not the only publication check. Private-session output is
+refused, as is output to a channel bound to a different owning team, even for a workspace-visible
+session. These checks also cover managed completions and generated media. They use current session
+visibility and channel bindings, not just the binding at launch. An unbound destination is not
+automatically a cross-team refusal; do not treat channel bindings as an outbound allowlist. Slack
+may still reject missing, archived, inaccessible, or rate-limited targets.
 
 Changes apply to new sessions. If you turn notifications on and an existing session cannot post to
 Slack, start a new session. Turning notifications off blocks future notification attempts.
@@ -365,6 +511,10 @@ Then, in the web app, create a **Slack Message** automation and add a **Slack Ch
 condition to filter by content. See
 [Slack Message Triggers](../AUTOMATIONS.md#slack-message-triggers) for the full field reference.
 
+Messages from other bots and integrations are ignored unless the automation turns on **Trigger on
+bot messages** (see [Bot messages](../AUTOMATIONS.md#bot-messages)). No extra Slack scope is needed:
+bot posts arrive on the same `message.channels` and `message.groups` subscriptions.
+
 ### Run feedback
 
 - A triggering message gets a 👀 reaction while its run is in flight.
@@ -380,21 +530,29 @@ condition to filter by content. See
   automation's instructions; without an explicit instruction it will answer every message it is
   woken for. A run that opened a pull request or produced other artifacts always posts, and
   interactive `@mention` sessions never decline — a person is waiting on a visible answer there.
-- Every reply in a thread continues the same session — during the run and after it finishes — for up
-  to 7 days after the thread's first trigger, like replying in an `@mention` thread. The reply is
-  routed to that session as a follow-up prompt (re-spawned from a snapshot if it had gone idle),
-  gets its own 👀 reaction and in-thread response, and does **not** need to match the trigger's text
-  condition — conditions gate new runs, not replies that continue a thread. A reply more than 7 days
-  after the first trigger starts a fresh run.
+- Authorized replies in a thread continue the same session, while the run starts, during it, and
+  after it finishes, until the session has been idle for 7 days, like replying in an `@mention`
+  thread. The reply is routed to that session as a follow-up prompt (re-spawned from a snapshot if
+  it had gone idle; held until the run's own first prompt while the run is starting), gets its own
+  👀 reaction and in-thread response, and does **not** need to match the trigger's text condition —
+  conditions gate new runs, not replies that continue a thread. A reply after 7 idle days starts a
+  fresh run.
+
+The automation scheduler checks each reply author's session collaboration access; a rejected author
+does not start a replacement run for that automation. This is separate from interactive
+mapped-thread handling: if no steerable session exists or enqueueing fails, the scheduler may
+re-evaluate the reply as a new trigger. Runs retain the automation's saved owning team, not the
+channel's interactive routing choice. Publication still checks current visibility and channel
+bindings, so admission does not guarantee a reply can be posted.
 
 ### Threat model
 
 Channel triggers widen who can start a coding session, so weigh the following before configuring
 them:
 
-- **Any member of a watched channel can trigger a run** simply by posting a matching message. Treat
-  every watched channel as a list of people authorized to start sessions against the automation's
-  repository.
+- **Any member of a watched channel can supply a matching trigger** unless conditions restrict them.
+  Treat watched channels as sources of untrusted requests to the automation's executor. Execution
+  membership and grant checks do not make the triggering message trustworthy.
 - **Prefer an allowlist.** Add a **Slack User** condition (`include`) so only specific people can
   trigger the automation, and keep watched channels small and trusted.
 - **Message text reaches the agent.** The triggering message becomes part of the prompt. Scope the
@@ -410,16 +568,44 @@ them:
 
 These notes are most useful for workspace admins deciding where the Slack bot should be available.
 
+### Team Channel Bindings
+
+A team lead or workspace administrator can bind a Slack channel in the team's **Channels** tab.
+**Primary** marks the team's main Slack binding; **Source** adds another channel that routes new
+interactive sessions to the same team. Both kinds determine ownership, not a repository or a default
+notification destination. Each channel can belong to only one team, and each team can have only one
+primary binding per provider. The bot must already be in the channel; externally shared Slack
+Connect channels cannot be bound.
+
+The Slack integration's `unboundChannels` policy is `workspace` by default: an unbound channel
+starts workspace-owned sessions. With `reject`, new interactive requests in unbound channels are
+refused until a binding is added. Unbound DMs remain workspace-scoped under either policy. A failed
+binding lookup stops the request rather than silently falling back to workspace ownership.
+
+Classification and target dropdowns use a live channel- and actor-scoped catalog. Bound-team
+catalogs require team membership or workspace-admin access and are filtered by repository grants and
+eligible environments. Starting a team-owned session checks the actor's actual team membership and
+grants for the selected target; Slack channel membership alone does not enroll that person in the
+Open-Inspect team. Picker submissions recheck the binding, so an old picker cannot transfer a
+request to another team. Repository routing rules and channel associations select a target within
+this scope; they do not grant access.
+
+`TEAMS_ENFORCEMENT` still defaults to `shadow`, not `on`. Do not assume full team-read isolation in
+that mode. Team creation checks, scoped catalogs, live Slack follow-up channel checks, private
+access, and Slack publication gates are not a promise that every team read is enforced.
+
 - Slack bot tokens stay server-side. They are not sent to sandboxes.
 - Slack requests are verified before Open-Inspect acts on them.
-- Slack-created sessions use deployment-level repository access. The repositories shown in Slack are
-  the repositories accessible to the configured GitHub App or SCM installation, not a per-Slack-user
-  GitHub permission list.
-- Slack identity linking is best-effort and is not used to approve repository access. To restrict
-  what Slack sessions can touch, limit the GitHub App installation to selected repositories and
-  invite the Slack bot only into trusted channels.
+- The source-control installation is the outer repository boundary, not a per-Slack-user GitHub
+  permission list. Team bindings, memberships, and repository grants further constrain team work.
+- Invite the bot only into trusted channels; identity linking does not itself grant team membership.
+- The first time someone messages the bot, Open-Inspect links them to an account by their Slack
+  profile email, which is why the app needs `users:read.email`. A new user whose email the bot
+  cannot read, typically an external Slack Connect user, cannot use the bot, and a new account is
+  created only when the email passes the workspace's sign-in rules (see
+  [Bot enrollment](../AUTH.md#bot-enrollment)). People the bot already knows keep working.
 - Bot messages are ignored so the Slack bot does not respond to itself.
-- Agent notifications use Slack channel membership as the access boundary.
+- Agent notifications require bot membership and the publication checks described above.
 - Accepted notification text is sanitized and shortened to fit Slack block limits; extremely large
   raw inputs are rejected.
 
@@ -434,12 +620,21 @@ mentions the bot. An ordinary channel message only starts a session when it matc
 Slack Message automation; verify its watched channel and conditions.
 
 If setup was just changed, confirm the Slack app event subscriptions and interactivity URLs in
-[Complete Slack Setup](../GETTING_STARTED.md#step-7b-complete-slack-setup-if-using-slack).
+[Complete Slack Setup](../GETTING_STARTED.md#complete-slack-setup).
 
 ### DMs do not start sessions
 
 The Slack app needs the direct message event subscription configured. Once that is set up, send the
 bot a plain DM with your request. No `@mention` is required.
+
+### The bot can't link or admit a new user
+
+"I couldn't read the email on your Slack profile" means the bot could not read the person's profile
+email: Slack can briefly fail to return it, Slack Connect users often hide it, or the app lacks the
+`users:read.email` scope (reinstall the app after adding it). "Your account is not authorized to
+join this Open-Inspect workspace" means no account has that email and it is not allowed by an email
+or domain sign-in rule; the person can sign in on the web with that email, or an Owner or
+Administrator can add it under **Settings > Workspace access > Who can sign in**.
 
 ### Open-Inspect asks which target to use
 
@@ -455,8 +650,8 @@ days, so older threads may need a fresh request.
 
 Confirm the Slack app has the `files:read` bot scope and was reinstalled after that scope was added.
 Use PNG, JPEG, WebP, or GIF images no larger than 10 MiB, with at most six images in one message.
-For a channel request or interactive channel follow-up, `@mention` the bot; DMs do not need a
-mention.
+For a channel request or interactive channel follow-up, `@mention` the bot unless the thread is a
+[solo thread](#solo-threads); DMs do not need a mention.
 
 The bot may also need `channels:history` for public-channel messages or `groups:history` for
 private-channel messages so it can recover file details that Slack omits from `app_mention` events.
@@ -471,9 +666,20 @@ content when Slack omits it from the `app_mention` event, and images inside a fo
 
 ### The wrong model or branch was used
 
-Open the Slack app's **Home** tab and check your model, reasoning effort, and branch preferences.
-Repository-specific branch overrides take priority over the global branch override. Preference
-changes apply to new Slack sessions.
+Open the Slack app's **Home** tab and check your agent harness, model, reasoning effort, and branch
+preferences. Repository-specific branch overrides take priority over the global branch override.
+Without an App Home model or agent harness, sessions use the **Default model** and **Agent harness**
+in **Settings > Integrations > Slack**, then the deployment default model. Preference changes apply
+to new Slack sessions.
+
+### Slack refused a request because of its model
+
+Claude Agent runs Anthropic models only. When your agent harness is Claude Agent, a non-Anthropic
+model from `!model`, App Home, or the defaults is refused with "Model ... cannot run on the Claude
+Agent harness." and no session starts. Start the request with `!model` and an Anthropic model, or
+change your model or agent harness in the Slack app's **Home** tab. Your harness is your App Home
+choice, else the workspace **Agent harness**. In an existing thread, the session keeps the harness
+it started on, so reply without `!model` or start a new thread.
 
 ### The agent could not post a Slack notification
 

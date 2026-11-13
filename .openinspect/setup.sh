@@ -27,11 +27,11 @@ check_cmd node
 check_cmd npm
 
 NODE_MAJOR=$(node -p 'process.versions.node.split(".")[0]')
-if (( NODE_MAJOR < 20 )); then
-  error "Node.js >= 20 required (found $(node -v)). Please upgrade."
-  exit 1
+if (( NODE_MAJOR < 24 )); then
+  warn "Node.js >= 24 required (found $(node -v)). Please upgrade; continuing setup."
+else
+  info "Node $(node -v) ✓"
 fi
-info "Node $(node -v) ✓"
 
 # ---------------------------------------------------------------------------
 # 2. Install npm dependencies (also triggers husky via prepare script)
@@ -116,7 +116,9 @@ fi
 # 6. Verify the setup
 # ---------------------------------------------------------------------------
 info "Running type check…"
-if npm run typecheck; then
+if [ "${OPENINSPECT_BOOT_MODE:-}" = "fresh" ]; then
+  info "Skipping type check on a fresh session boot."
+elif npm run typecheck; then
   info "Type check passed ✓"
 else
   warn "Type check had issues — you may need to build additional packages."

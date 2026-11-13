@@ -1,4 +1,8 @@
-import { describe, it, expect } from "vitest";
+import { createExecutionContext, env } from "cloudflare:test";
+import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
+import { handleControlPlaneHttp } from "../../src/cloudflare/http-host";
+import { createCloudflareEnv } from "../../src/cloudflare/platform";
+import { cleanD1Tables } from "./cleanup";
 import {
   collectMessages,
   initNamedSession,
@@ -6,13 +10,178 @@ import {
   openSandboxWs,
   queryDO,
   seedSandboxAuth,
+  serviceRequestHeaders,
+  closeWebSocket,
 } from "./helpers";
 import { hostContract } from "../conformance/session-core-conformance";
 
 const SANDBOX_TOKEN = "prompt-order-sandbox-token";
 const SANDBOX_ID = "prompt-order-sandbox";
 
+describe("POST /sessions/:id/prompt", () => {
+  beforeEach(cleanD1Tables);
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await cleanD1Tables();
+  });
+
+  it("preserves admitted identity and stored attribution without optional GitHub enrichment", async () => {
+    const caller = { userId: "a".repeat(32), role: "member" } as const;
+    const sessionName = `public-prompt-unlinked-${crypto.randomUUID()}`;
+    const url = `https://cp.test/sessions/${sessionName}/prompt`;
+    const body = JSON.stringify({ content: "Fix the bug" });
+    const headers = await serviceRequestHeaders(url, { method: "POST", body, as: caller });
+    await env.DB.prepare("DELETE FROM user_identities WHERE user_id = ?").bind(caller.userId).run();
+    const { stub } = await initSession({
+      sessionName,
+      userId: caller.userId,
+      scmLogin: "stored-login",
+    });
+
+    const response = await handleControlPlaneHttp(
+      new Request(url, { method: "POST", headers, body }),
+      createCloudflareEnv(env),
+      createExecutionContext()
+    );
+
+    expect(response.status).toBe(200);
+    const { messageId } = await response.json<{ messageId: string }>();
+    expect(
+      await queryDO<{ user_id: string; scm_login: string }>(
+        stub,
+        `SELECT p.user_id, p.scm_login FROM messages m
+         JOIN participants p ON p.id = m.author_id WHERE m.id = ?`,
+        messageId
+      )
+    ).toEqual([{ user_id: caller.userId, scm_login: "stored-login" }]);
+  });
+
+  it("rejects a caller-provided authorId without dispatching to the runtime", async () => {
+    const caller = { userId: "a".repeat(32), role: "member" } as const;
+    const sessionName = `public-prompt-author-${crypto.randomUUID()}`;
+    const url = `https://cp.test/sessions/${sessionName}/prompt`;
+    const body = JSON.stringify({ content: "Fix the bug", authorId: "someone-else" });
+    const headers = await serviceRequestHeaders(url, { method: "POST", body, as: caller });
+    await initSession({ sessionName, userId: caller.userId });
+    const platform = createCloudflareEnv(env);
+    const dispatch = vi.spyOn(platform, "SESSION");
+
+    const response = await handleControlPlaneHttp(
+      new Request(url, { method: "POST", headers, body }),
+      platform,
+      createExecutionContext()
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({
+      error: "Field 'authorId' is not accepted from verified callers",
+    });
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+
+  it.each(["automation", "agent"])(
+    "rejects a caller-asserted %s source without dispatching to the runtime",
+    async (source) => {
+      const caller = { userId: "a".repeat(32), role: "member" } as const;
+      const sessionName = `public-prompt-source-${crypto.randomUUID()}`;
+      const url = `https://cp.test/sessions/${sessionName}/prompt`;
+      const body = JSON.stringify({ content: "Fix the bug", source });
+      const headers = await serviceRequestHeaders(url, { method: "POST", body, as: caller });
+      await initSession({ sessionName, userId: caller.userId });
+      const platform = createCloudflareEnv(env);
+      const dispatch = vi.spyOn(platform, "SESSION");
+
+      const response = await handleControlPlaneHttp(
+        new Request(url, { method: "POST", headers, body }),
+        platform,
+        createExecutionContext()
+      );
+
+      expect(response.status).toBe(400);
+      expect(dispatch).not.toHaveBeenCalled();
+    }
+  );
+});
+
 describe("POST /internal/prompt", () => {
+  it.each([
+    ["duplicate", "Fix the bug", 200],
+    ["conflicting", "Fix a different bug", 409],
+  ])(
+    "keeps a newer participant identity when a %s retry repeats an older one",
+    async (_retry, retryContent, retryStatus) => {
+      const { stub } = await initSession();
+      const original = {
+        content: "Fix the bug",
+        authorId: "github:1001",
+        source: "github",
+        clientRequestId: "original-request",
+        canonicalUserId: "old-user",
+        scmEnrichment: { userId: "1001", login: "old-login", name: "Old Name", email: null },
+      };
+      const enqueue = (body: typeof original) =>
+        stub.fetch("http://internal/internal/prompt", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+      expect((await enqueue(original)).status).toBe(200);
+      const newer = await enqueue({
+        ...original,
+        content: "Fix the newer bug",
+        clientRequestId: "newer-request",
+        canonicalUserId: "current-user",
+        scmEnrichment: { ...original.scmEnrichment, login: "current-login", name: "Current Name" },
+      });
+      expect(newer.status).toBe(200);
+
+      const retry = await enqueue({ ...original, content: retryContent });
+
+      expect(retry.status).toBe(retryStatus);
+      expect(
+        await queryDO(
+          stub,
+          "SELECT canonical_user_id, scm_login, scm_name FROM participants WHERE user_id = ?",
+          original.authorId
+        )
+      ).toEqual([
+        { canonical_user_id: "current-user", scm_login: "current-login", scm_name: "Current Name" },
+      ]);
+      expect(
+        await queryDO(
+          stub,
+          "SELECT client_request_id, author_canonical_user_id FROM messages ORDER BY rowid"
+        )
+      ).toEqual([
+        { client_request_id: "original-request", author_canonical_user_id: "old-user" },
+        { client_request_id: "newer-request", author_canonical_user_id: "current-user" },
+      ]);
+    }
+  );
+
+  it("refuses a used request id from a new author without adding its participant", async () => {
+    const { stub } = await initSession();
+    const enqueue = (authorId: string, canonicalUserId: string) =>
+      stub.fetch("http://internal/internal/prompt", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          content: "Fix the bug",
+          authorId,
+          source: "github",
+          clientRequestId: "original-request",
+          canonicalUserId,
+        }),
+      });
+    expect((await enqueue("github:1001", "first-user")).status).toBe(200);
+
+    expect((await enqueue("github:2002", "other-user")).status).toBe(409);
+
+    expect(
+      await queryDO(stub, "SELECT id FROM participants WHERE user_id = ?", "github:2002")
+    ).toEqual([]);
+  });
+
   it("enqueues prompt and returns messageId", async () => {
     const { stub } = await initSession();
 
@@ -183,7 +352,7 @@ describe("POST /internal/prompt", () => {
       ["execution_complete", firstId],
       ["user_message", secondId],
     ]);
-    sandboxWs!.close();
+    await closeWebSocket(sandboxWs!);
   });
 
   hostContract("host.concurrent-prompt-claim", async () => {
@@ -216,7 +385,7 @@ describe("POST /internal/prompt", () => {
     expect(rows.map(({ status }) => status).sort()).toEqual(["pending", "processing"]);
     expect(prompts[0].messageId).toBe(rows.find(({ status }) => status === "processing")?.id);
 
-    sandboxWs!.close();
+    await closeWebSocket(sandboxWs!);
   });
 
   it("stores attachments as JSON", async () => {

@@ -1,42 +1,63 @@
+import { NextRequest } from "next/server";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-
-vi.mock("@/lib/server-auth-session", () => ({
-  getServerAuthSession: vi.fn(),
-}));
 
 vi.mock("@/lib/control-plane", () => ({
   controlPlaneUserFetch: vi.fn(),
 }));
 
-import { getServerAuthSession } from "@/lib/server-auth-session";
 import { controlPlaneUserFetch } from "@/lib/control-plane";
 import { POST } from "./route";
+import { MAX_WEB_PROMPT_CHARS } from "@open-inspect/shared/types/prompts";
 
 describe("session prompt API route", () => {
   beforeEach(() => {
     vi.resetAllMocks();
-    vi.mocked(getServerAuthSession).mockResolvedValue({ user: { id: "user-1" } } as never);
   });
 
   it("rejects blank prompts without attachments before proxying", async () => {
     const response = await POST(
-      new Request("http://localhost/api/sessions/session-1/prompt", {
+      new NextRequest("http://localhost/api/sessions/session-1/prompt", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          Cookie: "openinspect.session_token=test-session",
+          "Content-Type": "application/json",
+        },
         body: JSON.stringify({ content: " \n" }),
       }) as never,
       { params: Promise.resolve({ id: "session-1" }) }
     );
 
     expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({ error: "content is required" });
+    expect(controlPlaneUserFetch).not.toHaveBeenCalled();
+  });
+
+  it("reports oversized content before proxying", async () => {
+    const response = await POST(
+      new NextRequest("http://localhost/api/sessions/session-1/prompt", {
+        method: "POST",
+        headers: { Cookie: "openinspect.session_token=test-session" },
+        body: JSON.stringify({ content: "x".repeat(MAX_WEB_PROMPT_CHARS + 1) }),
+      }) as never,
+      { params: Promise.resolve({ id: "session-1" }) }
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({
+      error: `content exceeds ${MAX_WEB_PROMPT_CHARS} characters (got ${MAX_WEB_PROMPT_CHARS + 1})`,
+      code: "prompt_too_long",
+    });
     expect(controlPlaneUserFetch).not.toHaveBeenCalled();
   });
 
   it("rejects malformed attachment references before proxying", async () => {
     const response = await POST(
-      new Request("http://localhost/api/sessions/session-1/prompt", {
+      new NextRequest("http://localhost/api/sessions/session-1/prompt", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          Cookie: "openinspect.session_token=test-session",
+          "Content-Type": "application/json",
+        },
         body: JSON.stringify({
           content: "Look",
           attachments: [{ name: "remote.png", url: "https://example.com/image.png" }],
@@ -46,7 +67,7 @@ describe("session prompt API route", () => {
     );
 
     expect(response.status).toBe(400);
-    await expect(response.json()).resolves.toEqual({ error: "Invalid prompt request" });
+    expect((await response.json()).error).toContain("attachments");
     expect(controlPlaneUserFetch).not.toHaveBeenCalled();
   });
 
@@ -56,9 +77,12 @@ describe("session prompt API route", () => {
     );
 
     const response = await POST(
-      new Request("http://localhost/api/sessions/session-1/prompt", {
+      new NextRequest("http://localhost/api/sessions/session-1/prompt", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          Cookie: "openinspect.session_token=test-session",
+          "Content-Type": "application/json",
+        },
         body: JSON.stringify({
           content: "Look",
           attachments: [{ name: "shot.png", attachmentId: "attachment-1" }],
@@ -91,9 +115,12 @@ describe("session prompt API route", () => {
     );
 
     const response = await POST(
-      new Request("http://localhost/api/sessions/session-1/prompt", {
+      new NextRequest("http://localhost/api/sessions/session-1/prompt", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          Cookie: "openinspect.session_token=test-session",
+          "Content-Type": "application/json",
+        },
         body: JSON.stringify({ content: "Continue" }),
       }) as never,
       { params: Promise.resolve({ id: "session-1" }) }

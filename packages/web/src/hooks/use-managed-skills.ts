@@ -2,7 +2,10 @@ import useSWR, { mutate as mutateSWR } from "swr";
 import { z } from "zod";
 import { useAuthSession } from "@/lib/auth-session";
 import { browserApiFetch, type BrowserApiPath } from "@/lib/browser-api-fetch";
+import { browserApiJson } from "@/lib/browser-api-json";
 import {
+  bulkImportSkillsResponseSchema,
+  bulkSkillImportPreviewResponseSchema,
   listSkillProfilesResponseSchema,
   listSkillsResponseSchema,
   reimportSkillResponseSchema,
@@ -13,6 +16,10 @@ import {
   skillResponseSchema,
 } from "@open-inspect/shared/types/skills";
 import type {
+  BulkImportSkillsInput,
+  ImportedSkillIdentity,
+  BulkSkillImportPreviewInput,
+  BulkSkillImportPreviewResponse,
   CreateSkillInput,
   ImportSkillInput,
   ReimportSkillInput,
@@ -40,7 +47,6 @@ const skillContentPreviewSchema = z.strictObject({
 type SkillContentPreview = z.infer<typeof skillContentPreviewSchema>;
 
 const okResponseSchema = z.strictObject({ ok: z.literal(true) });
-const errorResponseSchema = z.object({ error: z.string() });
 
 const SKILLS_KEY = "/api/skills";
 const SKILL_PROFILES_KEY = "/api/skill-profiles";
@@ -83,21 +89,8 @@ async function validatedFetcher<T>(path: BrowserApiPath, schema: z.ZodType<T>): 
   return schema.parse(await response.json());
 }
 
-async function apiRequest<T>(
-  path: BrowserApiPath,
-  schema: z.ZodType<T>,
-  init?: RequestInit
-): Promise<T> {
-  const response = await browserApiFetch(path, {
-    ...init,
-    headers: { "Content-Type": "application/json", ...init?.headers },
-  });
-  const data: unknown = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    const parsedError = errorResponseSchema.safeParse(data);
-    throw new Error(parsedError.success ? parsedError.data.error : "Managed skills request failed");
-  }
-  return schema.parse(data);
+function apiRequest<T>(path: BrowserApiPath, schema: z.ZodType<T>, init?: RequestInit) {
+  return browserApiJson(path, schema, "Managed skills request failed", init);
 }
 
 export function useSkills() {
@@ -212,6 +205,26 @@ export async function importSkill(input: ImportSkillInput): Promise<Skill> {
       body: JSON.stringify(input),
     })
   ).skill;
+}
+
+export async function previewBulkSkillImport(
+  input: BulkSkillImportPreviewInput
+): Promise<BulkSkillImportPreviewResponse> {
+  return apiRequest(`${SKILLS_KEY}/import/bulk/preview`, bulkSkillImportPreviewResponseSchema, {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export async function bulkImportSkills(
+  input: BulkImportSkillsInput
+): Promise<ImportedSkillIdentity[]> {
+  return (
+    await apiRequest(`${SKILLS_KEY}/import/bulk`, bulkImportSkillsResponseSchema, {
+      method: "POST",
+      body: JSON.stringify(input),
+    })
+  ).skills;
 }
 
 export async function previewSkillReimport(

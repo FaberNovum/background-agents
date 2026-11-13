@@ -4,6 +4,7 @@ import type { MessageRepository } from "../message-repository";
 import type { SessionMessageQueue } from "../message-queue";
 import type { ArtifactRepository } from "../artifact-repository";
 import type { EventRepository } from "../event-repository";
+import type { UsageRepository } from "../usage-repository";
 import { MessageService } from "./message.service";
 
 function createService() {
@@ -17,6 +18,9 @@ function createService() {
     listArtifacts: vi.fn(),
     getArtifactById: vi.fn(),
   } as unknown as ArtifactRepository;
+  const usageRepository = {
+    listStepUsage: vi.fn(),
+  } as unknown as UsageRepository;
 
   const messageQueue = {
     enqueuePromptFromApi: vi.fn(),
@@ -30,13 +34,16 @@ function createService() {
       repository,
       eventRepository,
       artifactRepository,
+      usageRepository,
       messageQueue,
       stopExecution,
       parseArtifactMetadata,
+      transaction: (closure) => closure(),
     }),
     repository,
     eventRepository,
     artifactRepository,
+    usageRepository,
     messageQueue,
     stopExecution,
     parseArtifactMetadata,
@@ -49,6 +56,7 @@ describe("MessageService", () => {
     vi.mocked(messageQueue.enqueuePromptFromApi).mockResolvedValue({
       messageId: "msg-1",
       status: "queued",
+      deduplicated: false,
     });
 
     const result = await service.enqueuePrompt({
@@ -57,7 +65,7 @@ describe("MessageService", () => {
       source: "web",
     });
 
-    expect(result).toEqual({ messageId: "msg-1", status: "queued" });
+    expect(result).toEqual({ messageId: "msg-1", status: "queued", deduplicated: false });
     expect(messageQueue.enqueuePromptFromApi).toHaveBeenCalledWith({
       content: "hello",
       authorId: "user-1",
@@ -201,6 +209,7 @@ describe("MessageService", () => {
         status: "pending",
         error_message: null,
         stop_confirmation_deadline: null,
+        reported_cost_usd: 0,
         created_at: 3000,
         started_at: null,
         completed_at: null,
@@ -222,6 +231,7 @@ describe("MessageService", () => {
         status: "pending",
         error_message: null,
         stop_confirmation_deadline: null,
+        reported_cost_usd: 0,
         created_at: 2000,
         started_at: null,
         completed_at: null,
@@ -243,6 +253,7 @@ describe("MessageService", () => {
         status: "pending",
         error_message: null,
         stop_confirmation_deadline: null,
+        reported_cost_usd: 0,
         created_at: 1000,
         started_at: null,
         completed_at: null,
@@ -290,6 +301,7 @@ describe("MessageService", () => {
         status: "pending",
         error_message: null,
         stop_confirmation_deadline: null,
+        reported_cost_usd: 0,
         created_at: 1000,
         started_at: null,
         completed_at: null,

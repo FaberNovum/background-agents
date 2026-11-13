@@ -13,11 +13,13 @@
  * Closing a replaced socket is cleanup — the persisted identity is the fence.
  */
 
+import type { SandboxBootPhase } from "@open-inspect/shared/types/sandbox-events";
 import type { Logger } from "../logger";
 import {
   evaluateSandboxCommandAvailability,
   isDeadSandboxStatus,
 } from "../sandbox/lifecycle/decisions";
+import { parseStoredSandboxBootPhase } from "../sandbox/boot-phase";
 import { isSocketOpen, type AlarmScheduler, type SessionWebSocket } from "../platform-ports";
 import type { ClientInfo } from "../types";
 import type { SessionWebSocketHost } from "./platform";
@@ -41,7 +43,7 @@ export interface WebSocketManagerConfig {
 /** Ephemeral classification, not a dispatch permit that can survive an await. */
 export type SandboxCommandTarget =
   | { kind: "dispatch"; socket: SessionWebSocket }
-  | { kind: "booting" }
+  | { kind: "booting"; phase: SandboxBootPhase | null }
   | { kind: "unavailable" };
 
 // ---------------------------------------------------------------------------
@@ -134,6 +136,7 @@ export interface SessionWebSocketManager {
 
   enforceAuthTimeout(ws: SessionWebSocket, wsId: string): Promise<void>;
   getAuthenticatedClients(): IterableIterator<ClientInfo>;
+  /** Count open client sockets with unexpired cached or persisted authorization leases. */
   getConnectedClientCount(): number;
 }
 
@@ -243,6 +246,10 @@ export class SessionWebSocketManagerImpl implements SessionWebSocketManager {
 
   getSandboxSocket(): SessionWebSocket | null {
     const sandbox = this.sandboxRepository.getSandbox();
+    return this.getSandboxSocketForRow(sandbox);
+  }
+
+  private getSandboxSocketForRow(sandbox: SandboxRow | null): SessionWebSocket | null {
     const expectedSandboxId = sandbox?.modal_sandbox_id;
 
     // If the sandbox is in a terminal state, don't re-adopt stale WebSockets.
@@ -296,12 +303,15 @@ export class SessionWebSocketManagerImpl implements SessionWebSocketManager {
   }
 
   getSandboxCommandTarget(): SandboxCommandTarget {
-    const ws = this.getSandboxSocket();
-    if (!ws) return { kind: "unavailable" };
     const sandbox = this.sandboxRepository.getSandbox();
-    if (!sandbox) return { kind: "unavailable" };
+    const ws = this.getSandboxSocketForRow(sandbox);
+    if (!ws || !sandbox) return { kind: "unavailable" };
     const kind = evaluateSandboxCommandAvailability(sandbox.status);
-    return kind === "dispatch" ? { kind, socket: ws } : { kind };
+    if (kind === "dispatch") return { kind, socket: ws };
+    if (kind === "booting") {
+      return { kind, phase: parseStoredSandboxBootPhase(sandbox.boot_phase) };
+    }
+    return { kind };
   }
 
   clearSandboxSocket(): void {
@@ -553,14 +563,36 @@ export class SessionWebSocketManagerImpl implements SessionWebSocketManager {
     }
   }
 
+  /**
+   * Read-only: expired leases are retired by `expireAuthorizationLeases`, not
+   * by counting. The inactivity alarm calls this, so a lease that cannot be
+   * read counts as absent rather than failing the alarm that would stop an
+   * idle sandbox.
+   */
   getConnectedClientCount(): number {
+    const now = Date.now();
     let count = 0;
     for (const ws of this.host.sockets()) {
       const parsed = this.classify(ws);
-      if (parsed.kind !== "sandbox" && isSocketOpen(ws)) {
-        count++;
-      }
+      if (parsed.kind === "sandbox" || !isSocketOpen(ws)) continue;
+      const expiresAt = this.readAuthorizationExpiry(ws, parsed);
+      if (expiresAt !== null && expiresAt > now) count++;
     }
     return count;
+  }
+
+  private readAuthorizationExpiry(
+    ws: SessionWebSocket,
+    parsed: Extract<ConnectionClassification, { kind: "client" }>
+  ): number | null {
+    try {
+      return this.authorizationExpiry(ws, parsed);
+    } catch (error) {
+      this.log.warn("Client authorization lease lookup failed", {
+        ws_id: parsed.wsId,
+        error: error instanceof Error ? error : String(error),
+      });
+      return null;
+    }
   }
 }

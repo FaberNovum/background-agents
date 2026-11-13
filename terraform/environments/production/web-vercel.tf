@@ -6,14 +6,18 @@ module "web_app" {
   count  = var.web_platform == "vercel" ? 1 : 0
   source = "../../modules/vercel-project"
 
-  project_name = "open-inspect-${local.name_suffix}"
-  team_id      = var.vercel_team_id
-  framework    = "nextjs"
+  project_name      = "open-inspect-${local.name_suffix}"
+  team_id           = var.vercel_team_id
+  framework         = "nextjs"
+  serverless_region = var.web_serverless_region
 
-  # No git_repository - deploy via CLI/CI instead of auto-deploy on push
+  # No git_repository - deploy via CLI/CI instead of auto-deploy on push.
+  # The Node.js runtime comes from `engines.node` in packages/web/package.json
+  # (the repository's own floor), which overrides the project setting and
+  # resolves to the newest supported major; vercel/vercel 2.x cannot set 24.x.
   root_directory  = "packages/web"
   install_command = "cd ../.. && npm install && npm run build -w @open-inspect/shared"
-  build_command   = "next build"
+  build_command   = "npm run build"
 
   environment_variables = [
     # Control Plane

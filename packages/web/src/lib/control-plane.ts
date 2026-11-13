@@ -35,7 +35,8 @@ function unauthorizedResponse(correlation: { requestId: string; traceId: string 
  */
 export async function controlPlaneUserFetch(
   path: string,
-  options: RequestInit = {}
+  options: RequestInit = {},
+  { streamResponse = false, timeoutMs }: { streamResponse?: boolean; timeoutMs?: number } = {}
 ): Promise<Response> {
   const normalizedPath = path.startsWith("/") ? path : `/${path}`;
   const correlation = await getRequestCorrelation();
@@ -54,6 +55,12 @@ export async function controlPlaneUserFetch(
       return unauthorizedResponse(correlation);
     }
 
+    // URL normalization must not move a user request onto a service-only route.
+    const parsedPath = new URL(normalizedPath, "https://control-plane.invalid");
+    if (parsedPath.pathname !== normalizedPath.split("?", 1)[0] || parsedPath.hash) {
+      return Response.json({ error: "Invalid control-plane path" }, { status: 400 });
+    }
+
     const requestHeaders = new Headers(options.headers);
     requestHeaders.set("Cookie", cookieHeader);
     if (!requestHeaders.has("Content-Type")) {
@@ -69,6 +76,8 @@ export async function controlPlaneUserFetch(
       traceId: correlation.traceId,
       correlationFields,
       transportOptions,
+      streamResponse,
+      timeoutMs,
     });
   } catch (error) {
     log.error("control_plane.fetch_failed", {

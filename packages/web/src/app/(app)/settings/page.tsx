@@ -13,18 +13,29 @@ import { SettingsMobileHeader } from "@/components/settings/settings-mobile-head
 import { useSettingsIsMobile } from "@/components/settings/settings-viewport-context";
 import { supportsRepoImages } from "@/lib/sandbox-provider";
 import { useCurrentUserAuthorization } from "@/hooks/use-current-user-authorization";
+import { useMeTeams } from "@/hooks/use-teams";
 import { getSettingsPanel, resolveSettingsCategory } from "@/components/settings/settings-registry";
+import { useConfirmSettingsNavigation } from "@/components/settings/settings-navigation-guard";
 
 function SettingsPageContent() {
+  const confirmNavigation = useConfirmSettingsNavigation();
   const searchParams = useSearchParams();
   const tabParam = searchParams.get("tab");
   const repoImagesEnabled = supportsRepoImages();
   const isMobile = useSettingsIsMobile();
   const { hasPermission, loading } = useCurrentUserAuthorization();
-  const initialCategory = resolveSettingsCategory(tabParam, repoImagesEnabled, hasPermission);
+  const { teams, loading: teamsLoading } = useMeTeams();
+  const canEditTeam = teams.some((team) => team.capabilities?.canEditMetadata === true);
+  const initialCategory = resolveSettingsCategory(
+    tabParam,
+    repoImagesEnabled,
+    hasPermission,
+    canEditTeam
+  );
   const [activeCategory, setActiveCategoryRaw] = useState<SettingsCategory>(initialCategory);
 
   function selectCategory(category: SettingsCategory, trigger: HTMLButtonElement) {
+    if (category !== activeCategory && !confirmNavigation()) return;
     setActiveCategoryRaw(category);
     const url = `/settings?tab=${category}`;
     if (isMobile) {
@@ -59,9 +70,11 @@ function SettingsPageContent() {
 
   function showMobileList() {
     if (window.history.state?.openInspectSettingsDetail) {
+      if (!("navigation" in window) && !confirmNavigation()) return;
       window.history.back();
       return;
     }
+    if (!confirmNavigation()) return;
     window.history.replaceState(window.history.state, "", "/settings");
     setActiveCategoryRaw(DEFAULT_SETTINGS_CATEGORY);
     showMobileView("list");
@@ -73,7 +86,7 @@ function SettingsPageContent() {
     const syncFromHistory = () => {
       const requestedCategory = new URLSearchParams(window.location.search).get("tab");
       const nextCategory = isSettingsCategory(requestedCategory, repoImagesEnabled)
-        ? resolveSettingsCategory(requestedCategory, repoImagesEnabled, hasPermission)
+        ? resolveSettingsCategory(requestedCategory, repoImagesEnabled, hasPermission, canEditTeam)
         : null;
       if (nextCategory) {
         setActiveCategoryRaw(nextCategory);
@@ -90,30 +103,34 @@ function SettingsPageContent() {
         }
       });
     };
-
     window.addEventListener("popstate", syncFromHistory);
     return () => window.removeEventListener("popstate", syncFromHistory);
-  }, [hasPermission, isMobile, repoImagesEnabled]);
+  }, [canEditTeam, hasPermission, isMobile, repoImagesEnabled]);
 
   // Sync state when searchParams change via client-side navigation
   useEffect(() => {
     if (isSettingsCategory(tabParam, repoImagesEnabled)) {
-      setActiveCategoryRaw(resolveSettingsCategory(tabParam, repoImagesEnabled, hasPermission));
+      setActiveCategoryRaw(
+        resolveSettingsCategory(tabParam, repoImagesEnabled, hasPermission, canEditTeam)
+      );
       setMobileView("detail");
       return;
     }
 
     if (!isMobile || !mobileTriggerRef.current) {
-      setActiveCategoryRaw(resolveSettingsCategory(null, repoImagesEnabled, hasPermission));
+      setActiveCategoryRaw(
+        resolveSettingsCategory(null, repoImagesEnabled, hasPermission, canEditTeam)
+      );
     }
     setMobileView("list");
-  }, [hasPermission, isMobile, repoImagesEnabled, tabParam]);
+  }, [hasPermission, canEditTeam, isMobile, repoImagesEnabled, tabParam]);
 
-  if (loading) return null;
+  if (loading || (tabParam === "teams" && teamsLoading)) return null;
   const renderedCategory = resolveSettingsCategory(
     activeCategory,
     repoImagesEnabled,
-    hasPermission
+    hasPermission,
+    canEditTeam
   );
   const ActivePanel = getSettingsPanel(renderedCategory);
   const content = (

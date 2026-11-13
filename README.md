@@ -1,5 +1,7 @@
 # Background Agents: Open-Inspect
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 An open-source background agents coding system inspired by
 [Ramp's Inspect](https://builders.ramp.com/post/why-we-built-our-background-agent).
 
@@ -24,32 +26,40 @@ Open-Inspect provides a hosted background coding agent that can:
 ## Security Model (Single-Tenant Only)
 
 > **Important**: This system is designed for **single-tenant deployment only**, where all users are
-> trusted members of the same organization with access to the same repositories.
+> trusted members of the same organization. Teams add internal access controls, not tenant
+> isolation.
 
 ### How It Works
 
-The system uses a shared GitHub App installation for git operations (clone, fetch, push). The
-control plane mints short-lived installation tokens server-side and brokers them to sandboxes
-through the git credential helper on demand. This means:
+Teams own sessions, environments, and automations. A session's Workspace, Team, or Private
+visibility is separate from its fixed ownership; resources cannot move between teams or to/from the
+workspace. Team-owned session actions require current owning-team membership, even for workspace
+Owners and Administrators. With enforcement on, deletion additionally requires `sessions.delete` and
+being the session owner, an owning-team lead, or a workspace administrator; team-owned and private
+sessions apply their action checks in every mode.
 
-- **Authorized users share the same GitHub App credentials** - The GitHub App must be installed on
-  your organization's repositories, and active users whose role permits repository use can access
-  any repo the App has access to
-- **No per-user repository access validation** - The system does not verify that a user has
-  permission to access a specific repository before creating a session
-- **GitHub users' OAuth tokens are used for PR creation** - For GitHub logins, PRs are created using
-  the user's GitHub OAuth token, ensuring proper attribution and that they can only create PRs on
-  repos they have write access to. Users who sign in another way (e.g. Google) carry no SCM token,
-  so their PRs fall back to the shared GitHub App bot
+Private sessions are readable by their owner and explicit collaborators. Workspace Owners have an
+audited break-glass read path, not automatic collaboration or sandbox access. Team visibility's read
+boundary requires `TEAMS_ENFORCEMENT=on`; the deployment default remains `shadow`.
 
-### Token Architecture
+For a single-team deployment, create one team, add the users who need to act on its sessions, and
+grant its repositories. Existing workspace-owned rows are not moved or hidden. Even with every user
+in one team, being a Member does not let someone delete another member's session under enforcement
+unless they satisfy the ownership/lead rule. Follow the
+[first-team setup](docs/GETTING_STARTED.md#step-10-create-the-first-team-and-test-a-session) before
+inviting users.
 
-| Token Type         | Purpose                                | Scope                            |
-| ------------------ | -------------------------------------- | -------------------------------- |
-| GitHub App Token   | Brokered git clone/fetch/push auth     | All repos where App is installed |
-| User OAuth Token   | Create PRs, user info                  | Repos user has access to         |
-| Sandbox Auth Token | Sandbox-to-control-plane session calls | Single session                   |
-| WebSocket Token    | Real-time session auth                 | Single session                   |
+The shared GitHub App installation bounds workspace repository reach. Sandbox git credentials are
+limited to the session's persisted repositories and, for team-owned sessions, current owning-team
+grants. Workspace permissions and resource access still apply; Open-Inspect does not compare a
+user's personal GitHub repository permissions before creating a session. GitLab credentials remain a
+deployment-wide PAT rather than a per-session token.
+
+Credentials are brokered on demand but cached on disk, so snapshots can retain them. Grant removal
+does not immediately revoke issued tokens. See the canonical
+[Authentication and Authorization guide](docs/AUTH.md) for access rules and
+[credential boundaries](docs/AUTH.md#repository-and-credential-boundaries), including user versus
+App identity and snapshot limitations.
 
 ### Why Single-Tenant Only
 
@@ -123,19 +133,20 @@ ownership, bots, and member suspension.
 
 ## Packages
 
-| Package                                           | Description                                 |
-| ------------------------------------------------- | ------------------------------------------- |
-| [control-plane](packages/control-plane)           | Cloudflare Workers + Durable Objects        |
-| [web](packages/web)                               | Next.js web client                          |
-| [sandbox-runtime](packages/sandbox-runtime)       | Shared in-sandbox agent runtime             |
-| [modal-infra](packages/modal-infra)               | Modal sandbox infrastructure                |
-| [daytona-infra](packages/daytona-infra)           | Daytona snapshot infrastructure             |
-| [e2b-infra](packages/e2b-infra)                   | E2B sandbox template infrastructure         |
-| [opencomputer-infra](packages/opencomputer-infra) | OpenComputer template infrastructure        |
-| [slack-bot](packages/slack-bot)                   | Slack integration (sessions from messages)  |
-| [github-bot](packages/github-bot)                 | GitHub integration (auto-review, @mention)  |
-| [linear-bot](packages/linear-bot)                 | Linear integration (issue → coding session) |
-| [shared](packages/shared)                         | Shared types and utilities                  |
+| Package                                     | Description                                 |
+| ------------------------------------------- | ------------------------------------------- |
+| [control-plane](packages/control-plane)     | Cloudflare Workers + Durable Objects        |
+| [web](packages/web)                         | Next.js web client                          |
+| [sandbox-runtime](packages/sandbox-runtime) | Shared in-sandbox agent runtime             |
+| [modal-infra](packages/modal-infra)         | Modal sandbox infrastructure                |
+| [daytona-infra](packages/daytona-infra)     | Daytona snapshot infrastructure             |
+| [e2b-infra](packages/e2b-infra)             | E2B sandbox template infrastructure         |
+| [boat-infra](packages/boat-infra)           | Boat sandbox snapshot infrastructure        |
+| [slack-bot](packages/slack-bot)             | Slack integration (sessions from messages)  |
+| [github-bot](packages/github-bot)           | GitHub integration (auto-review, @mention)  |
+| [linear-bot](packages/linear-bot)           | Linear integration (issue → coding session) |
+| [mcp-server](packages/mcp-server)           | Local MCP server (personal access token)    |
+| [shared](packages/shared)                   | Shared types and utilities                  |
 
 ## Getting Started
 
@@ -209,19 +220,14 @@ await configureGitIdentity({
 
 Choose the AI model that fits your task, with per-session reasoning effort controls:
 
-| Provider         | Models                                                                  |
-| ---------------- | ----------------------------------------------------------------------- |
-| Anthropic        | Claude Haiku 4.5, Sonnet 4.5/4.6/5, Opus 4.5/4.6/4.7/4.8/5, Fable 5/5.1 |
-| OpenAI           | GPT 5.4, GPT 5.5, 5.3 Codex, 5.3 Codex Spark                            |
-| xAI / SuperGrok  | Grok models (opt-in)                                                    |
-| OpenCode Zen     | Kimi K2.5/K2.6/K3, MiniMax M2.5, Qwen3.7 Max, GLM 5/5.1/5.2 (opt-in)    |
-| Z.AI Coding Plan | GLM 5.2/5.3 (opt-in)                                                    |
+Anthropic and OpenAI models are enabled by default. xAI / SuperGrok, OpenCode Zen and Go, Z.AI
+Coding Plan, and DeepSeek models are opt-in. See [Available Models](docs/AVAILABLE_MODELS.md) for
+current model IDs, descriptions, and reasoning efforts.
 
 OpenAI models work with your existing ChatGPT subscription via OAuth — no separate API key needed.
 Anthropic models can run on the **Claude Agent** harness with a connected Claude subscription; see
 [Using the Claude Agent Harness](docs/CLAUDE_AGENT.md). Grok models work with an eligible SuperGrok
 subscription through control-plane-managed OAuth. See
-**[docs/AVAILABLE_MODELS.md](docs/AVAILABLE_MODELS.md)** for the full model list and
 **[docs/OPENAI_MODELS.md](docs/OPENAI_MODELS.md)** or **[docs/GROK_MODELS.md](docs/GROK_MODELS.md)**
 for subscription setup instructions.
 
@@ -238,6 +244,9 @@ Interact with agents from wherever your team already works:
   per-repo. See [GitHub integration](docs/integrations/GITHUB.md)
 - **Linear Bot** — Mention or assign the agent on an issue to start a coding session, post progress
   activities, and link the resulting PR. See [Linear integration](docs/integrations/LINEAR.md)
+- **MCP Server** — Let Claude Code or another MCP client read sessions and automation runs, and
+  optionally create and run automations or import skills, with a personal access token. See
+  [MCP server](packages/mcp-server/README.md)
 - **Webhooks** — Trigger sessions from any external system via authenticated HTTP POST
 
 ### Automations
@@ -259,7 +268,7 @@ See **[docs/AUTOMATIONS.md](docs/AUTOMATIONS.md)** for setup instructions.
 
 Every session runs in an isolated sandbox backend with a full development environment:
 
-- **Pre-installed:** Node.js 22, Python 3.12, Bun, git, GitHub CLI, build-essential
+- **Pre-installed:** Node.js 24, Python 3.12, Bun, git, GitHub CLI, build-essential
 - **Browser automation:** agent-browser CLI with headless Chromium for screenshots, visual diffs,
   and UI verification
 - **Code-server:** Optional browser-based VS Code connected to the session workspace
@@ -314,8 +323,15 @@ docker compose up -d postgres redis
   rather than collected or shown. Image builds report neither, having no session to report to. See
   [How Open-Inspect Works](docs/HOW_IT_WORKS.md#fresh-start-no-snapshot)
 - Both hooks receive `OPENINSPECT_BOOT_MODE` (`build`, `fresh`, `repo_image`, `snapshot_restore`)
-- Git operations in hooks can authenticate to other private repos on the configured SCM host when
-  the shared installation has access
+- GitHub session credentials used by hooks are limited to the session's persisted repository set,
+  intersected with current owning-team grants for team-owned sessions. Private submodules,
+  Git-backed dependencies, and sibling clones must be included in that set; App installation access
+  alone does not expand it
+- GitHub image-build credentials cover only the build repositories, with owning-team grants applied
+  for team-owned environment builds. GitLab uses a deployment-wide PAT without per-session
+  narrowing. See
+  [Repository and Credential Boundaries](docs/AUTH.md#repository-and-credential-boundaries) for
+  details, including credential caching and grant revocation
 
 ## License
 
@@ -329,8 +345,8 @@ built with:
 - [Modal](https://modal.com) - Cloud sandbox infrastructure
 - [Daytona](https://www.daytona.io) - Cloud development sandboxes
 - [Vercel Sandbox](https://vercel.com/docs/vercel-sandbox) - Cloud sandbox infrastructure
-- [OpenComputer](https://www.opencomputer.dev) - Cloud sandbox infrastructure
 - [E2B](https://e2b.dev) - Cloud sandbox infrastructure
+- [Boat](https://boat.dev) - Cloud sandbox infrastructure
 - [Cloudflare Workers](https://workers.cloudflare.com) - Edge computing
 - [OpenCode](https://opencode.ai) - Coding agent runtime (built-in harness)
 - [Claude Agent SDK](https://docs.anthropic.com/en/docs/agent-sdk) - Coding agent runtime (Claude

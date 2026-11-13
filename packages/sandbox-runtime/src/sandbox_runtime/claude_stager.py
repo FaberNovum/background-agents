@@ -10,33 +10,35 @@ so ``start()`` only prepares the filesystem the child will see:
   tree through ``ManagedSkillsMaterializer``);
 - the standalone bin scripts the agent calls from Bash;
 - a small JSON handoff (``CLAUDE_HARNESS_FILE_PATH``) telling the bridge which
-  workdir and config dir the supervisor chose. It carries decisions only: MCP
-  configuration, which can hold credentials, reaches the bridge through its
-  own ``SESSION_CONFIG`` and is never written to disk here.
+  workdir, additional directories and config dir the supervisor chose. It
+  carries decisions only: MCP configuration, which can hold credentials,
+  reaches the bridge through its own ``SESSION_CONFIG`` and is never written
+  to disk here.
+
+In a multi-repository session the workdir is the primary checkout, not the
+shared ``/workspace``: Claude Code takes ``.claude/settings.json`` (hooks
+included) only from where it starts. The other members become additional
+directories (``--add-dir``).
 """
 
 from __future__ import annotations
 
-import json
 import os
-import shutil
-from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .constants import CLAUDE_HARNESS_FILE_PATH
-from .mcp_packages import McpPackageInstaller
-from .sandbox_bin import install_bin_scripts
+from .harness_stager import BUNDLED_SKILLS_PATH, HarnessHandoff, HarnessStager
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
+    from .mcp_packages import McpPackageInstaller
     from .repo_config import RepoEntry
     from .runtime_config import ClaudeStagerConfig
 
 
 DEFAULT_CLAUDE_CONFIG_DIR_NAME = ".openinspect/claude"
-BUNDLED_SKILLS_PATH = Path("/app/sandbox_runtime/skills")
 
 
 def resolve_claude_config_dir() -> Path:
@@ -72,40 +74,11 @@ def isolated_claude_config_dir(
     return candidate
 
 
-@dataclass(frozen=True)
-class ClaudeHarnessHandoff:
-    """What the supervisor decided and the bridge must use. Never a secret."""
-
-    workdir: Path
-    config_dir: Path
-    has_repository: bool
-
-    def write(self, path: Path = Path(CLAUDE_HARNESS_FILE_PATH)) -> None:
-        payload = json.dumps(
-            {
-                "workdir": str(self.workdir),
-                "configDir": str(self.config_dir),
-                "hasRepository": self.has_repository,
-            }
-        )
-        # Owner-only and atomic: a reader sees the whole file or none of it.
-        staging = path.with_name(path.name + ".tmp")
-        descriptor = os.open(staging, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(descriptor, "w") as handle:
-            handle.write(payload)
-        staging.replace(path)
-
-    @classmethod
-    def read(cls, path: Path = Path(CLAUDE_HARNESS_FILE_PATH)) -> ClaudeHarnessHandoff:
-        data = json.loads(path.read_text())
-        return cls(
-            workdir=Path(str(data["workdir"])),
-            config_dir=Path(str(data["configDir"])),
-            has_repository=bool(data.get("hasRepository")),
-        )
+class ClaudeHarnessHandoff(HarnessHandoff):
+    default_path = Path(CLAUDE_HARNESS_FILE_PATH)
 
 
-class ClaudeStager:
+class ClaudeStager(HarnessStager):
     """``HarnessProcessOwner`` for the Claude harness; ``exit_code()`` is always ``None``."""
 
     def __init__(
@@ -113,70 +86,40 @@ class ClaudeStager:
         config: ClaudeStagerConfig,
         log: Any,
         *,
+        mcp_packages: McpPackageInstaller,
         config_dir: Path | None = None,
         bundled_skills_path: Path = BUNDLED_SKILLS_PATH,
         handoff_path: Path = Path(CLAUDE_HARNESS_FILE_PATH),
-        mcp_packages: McpPackageInstaller | None = None,
     ) -> None:
-        self.config = config
-        self.log = log
-        self.config_dir = config_dir or resolve_claude_config_dir()
-        self.bundled_skills_path = bundled_skills_path
-        self.handoff_path = handoff_path
-        self._mcp_packages = mcp_packages or McpPackageInstaller(log)
-        self.started = False
+        super().__init__(
+            config,
+            log,
+            config_dir=config_dir or resolve_claude_config_dir(),
+            bundled_skills_path=bundled_skills_path,
+            handoff_path=handoff_path,
+            mcp_packages=mcp_packages,
+            log_prefix="claude",
+        )
 
-    @property
-    def skills_dir(self) -> Path:
-        return self.config_dir / "skills"
-
-    async def start(self, repositories: Sequence[RepoEntry], workdir: Path) -> None:
-        self.log.info("claude.stage", config_dir=str(self.config_dir), workdir=str(workdir))
+    def _prepare_config_dir(self) -> None:
         self.config_dir.mkdir(parents=True, exist_ok=True)
-        # Nothing the harness writes here is a credential; the directory is
-        # only for Claude's own state (transcripts under projects/, settings).
-        self._install_bundled_skills()
-        install_bin_scripts(self.log)
-        # Best effort, as at OpenCode boot: a local npx server resolved now
-        # does not download during the first prompt.
-        try:
-            await self._mcp_packages.install(list(self.config.mcp_servers))
-        except Exception as error:
-            self.log.warn("claude.mcp_preinstall_failed", exc=error)
-        ClaudeHarnessHandoff(
-            workdir=workdir,
-            config_dir=self.config_dir,
-            has_repository=self.config.has_repository,
-        ).write(self.handoff_path)
-        self.started = True
-        self.log.info("claude.staged", repo_count=len(repositories))
 
-    def _install_bundled_skills(self) -> None:
-        if not self.bundled_skills_path.is_dir():
-            return
-        installed = 0
-        for skill_dir in self.bundled_skills_path.iterdir():
-            if not skill_dir.is_dir() or not (skill_dir / "SKILL.md").exists():
-                continue
-            shutil.copytree(
-                skill_dir,
-                self.skills_dir / skill_dir.name,
-                dirs_exist_ok=True,
-                ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".DS_Store"),
-                symlinks=True,
-            )
-            installed += 1
-        if installed:
-            self.log.info(
-                "claude.skills_installed", skills_path=str(self.skills_dir), count=installed
-            )
+    def _agent_directories(
+        self, repositories: Sequence[RepoEntry], workdir: Path
+    ) -> tuple[Path, tuple[Path, ...], Path | None]:
+        if len(repositories) < 2:
+            return workdir, (), None
+        primary, *others = repositories
+        members = tuple(repo.path for repo in others if _is_checkout(repo.path))
+        # A primary whose checkout is missing (a failed sync on restore) keeps
+        # the workspace as the start directory rather than an empty one.
+        if not _is_checkout(primary.path):
+            return workdir, members, workdir
+        return primary.path, members, workdir
 
-    async def stop(self) -> None:
-        return None
 
-    def exit_code(self) -> int | None:
-        # There is no resident vendor process; the SDK child belongs to the bridge.
-        return None
+def _is_checkout(path: Path) -> bool:
+    return (path / ".git").exists()
 
 
 def _resolve_lenient(path: Path) -> Path:

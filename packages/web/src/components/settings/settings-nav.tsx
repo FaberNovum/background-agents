@@ -6,8 +6,10 @@ import { BackIcon, ChevronRightIcon, SearchIcon } from "@/components/ui/icons";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { useCurrentUserAuthorization } from "@/hooks/use-current-user-authorization";
+import { useMeTeams } from "@/hooks/use-teams";
 import { useSettingsIsMobile } from "./settings-viewport-context";
 import { getSettingsGroups, type SettingsCategory } from "./settings-registry";
+import { useConfirmSettingsNavigation } from "./settings-navigation-guard";
 
 export {
   DEFAULT_SETTINGS_CATEGORY,
@@ -43,10 +45,16 @@ function SettingsSearch({ value, onChange }: { value: string; onChange: (value: 
  * Renders searchable settings navigation containing only categories the current user may access.
  */
 export function SettingsNav({ activeCategory, onSelect }: SettingsNavProps) {
+  const confirmNavigation = useConfirmSettingsNavigation();
   const isMobile = useSettingsIsMobile();
   const [query, setQuery] = useState("");
   const { hasPermission } = useCurrentUserAuthorization();
-  const groups = getSettingsGroups({ query, hasPermission });
+  const { teams } = useMeTeams();
+  const groups = getSettingsGroups({
+    query,
+    hasPermission,
+    canEditTeam: teams.some((team) => team.capabilities?.canEditMetadata === true),
+  });
 
   const navigation = (
     <div className="space-y-6">
@@ -144,7 +152,12 @@ export function SettingsNav({ activeCategory, onSelect }: SettingsNavProps) {
     >
       <div className="border-b border-border-muted px-4 py-4">
         <Button asChild variant="ghost" size="sm" className="mb-5 -ml-3 gap-2">
-          <Link href="/">
+          <Link
+            href="/"
+            onNavigate={(event) => {
+              if (!confirmNavigation()) event.preventDefault();
+            }}
+          >
             <span aria-hidden="true">
               <BackIcon className="h-4 w-4" />
             </span>

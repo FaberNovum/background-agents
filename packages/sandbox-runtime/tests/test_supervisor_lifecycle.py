@@ -1,7 +1,15 @@
 import asyncio
+import os
+import signal
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
+from sandbox_runtime import supervisor as supervisor_module
+from sandbox_runtime.constants import BOOT_COMPLETE_MARKER_ENV_VAR
+from sandbox_runtime.repo_config import RepoEntry
 from sandbox_runtime.repository_boot import RepositoryBootResult
 from sandbox_runtime.runtime_config import BootMode, RuntimeConfig
 from sandbox_runtime.supervisor import SandboxSupervisor
@@ -80,6 +88,49 @@ async def test_regular_boot_phase_order(tmp_path, monkeypatch):
     ]
 
 
+def _session_boot_with_marker(tmp_path, monkeypatch):
+    marker = tmp_path / "state" / "boot-complete"
+    monkeypatch.setenv(BOOT_COMPLETE_MARKER_ENV_VAR, str(marker))
+    monkeypatch.delenv("IMAGE_BUILD_MODE", raising=False)
+    monkeypatch.delenv("RESTORED_FROM_SNAPSHOT", raising=False)
+    monkeypatch.delenv("FROM_REPO_IMAGE", raising=False)
+    supervisor, repository, *_ = _supervisor(tmp_path, [])
+    return supervisor, repository, marker
+
+
+async def test_completed_boot_records_the_marker_a_provider_asked_for(tmp_path, monkeypatch):
+    supervisor, _repository, marker = _session_boot_with_marker(tmp_path, monkeypatch)
+
+    assert await supervisor.run() is True
+
+    assert marker.is_file()
+
+
+async def test_interrupted_boot_leaves_no_marker(tmp_path, monkeypatch):
+    supervisor, repository, marker = _session_boot_with_marker(tmp_path, monkeypatch)
+    repository.boot = AsyncMock(side_effect=RuntimeError("git sync failed for acme/repo"))
+    supervisor._report_fatal_error = AsyncMock()
+
+    assert await supervisor.run() is False
+
+    # The next start on this disk boots fresh and repeats the clone and setup.
+    assert not marker.exists()
+
+
+async def test_boot_that_continued_past_a_failed_setup_still_records_the_marker(
+    tmp_path, monkeypatch
+):
+    supervisor, repository, marker = _session_boot_with_marker(tmp_path, monkeypatch)
+    repository.boot = AsyncMock(
+        return_value=RepositoryBootResult(True, [], False, True, (), Path(tmp_path))
+    )
+
+    assert await supervisor.run() is True
+
+    # A session ran here; a later fresh boot would check out over its work.
+    assert marker.is_file()
+
+
 async def test_regular_boot_passes_repository_workspace_to_services(tmp_path, monkeypatch):
     supervisor, repository, opencode_server, _agent_bridge, code_server, terminal, _desktop = (
         _supervisor(tmp_path, [])
@@ -156,6 +207,107 @@ async def test_build_boot_excludes_runtime_services(tmp_path, monkeypatch):
     agent_bridge.start.assert_not_awaited()
 
 
+async def test_build_boot_refreshes_models_catalog_before_reporting_success(tmp_path, monkeypatch):
+    events = []
+    supervisor, *_ = _supervisor(tmp_path, events)
+    supervisor_module.ensure_model_catalog.side_effect = lambda *_args, **_kwargs: (
+        events.append("models_catalog") or True
+    )
+    monkeypatch.setenv("IMAGE_BUILD_MODE", "true")
+    callback = MagicMock()
+
+    async def report_success(**_kwargs):
+        events.append("callback")
+        supervisor.shutdown_event.set()
+        return True
+
+    callback.report_success = AsyncMock(side_effect=report_success)
+    callback.report_failure = AsyncMock()
+
+    assert await supervisor.run(callback) is True
+    assert events == ["repository:build", "models_catalog", "callback"]
+    supervisor_module.ensure_model_catalog.assert_awaited_once_with(
+        os.environ, supervisor.log, refresh=True
+    )
+
+
+async def test_build_without_usable_catalog_reports_failure_instead_of_success(
+    tmp_path, monkeypatch
+):
+    supervisor, *_ = _supervisor(tmp_path, [])
+    monkeypatch.setenv("IMAGE_BUILD_MODE", "true")
+    supervisor_module.ensure_model_catalog.return_value = False
+    supervisor._report_fatal_error = AsyncMock()
+    callback = MagicMock()
+
+    async def report_success(**_kwargs):
+        supervisor.shutdown_event.set()
+        return True
+
+    callback.report_success = AsyncMock(side_effect=report_success)
+    callback.report_failure = AsyncMock(return_value=True)
+
+    assert await supervisor.run(callback) is False
+    callback.report_success.assert_not_awaited()
+    callback.report_failure.assert_awaited_once_with("Model price catalog unavailable")
+    assert not any(
+        call.args == ("image_build.complete",) for call in supervisor.log.info.mock_calls
+    )
+
+
+async def test_session_boot_checks_catalog_without_forcing_refresh(tmp_path, monkeypatch):
+    supervisor, *_ = _supervisor(tmp_path, [])
+    monkeypatch.delenv("IMAGE_BUILD_MODE", raising=False)
+    monkeypatch.delenv("RESTORED_FROM_SNAPSHOT", raising=False)
+    monkeypatch.delenv("FROM_REPO_IMAGE", raising=False)
+
+    assert await supervisor.run() is True
+    supervisor_module.ensure_model_catalog.assert_awaited_once_with(os.environ, supervisor.log)
+
+
+@pytest.mark.parametrize("harness", ["opencode", "codex", "claude"])
+@pytest.mark.parametrize("mode", [BootMode.FRESH, BootMode.REPO_IMAGE, BootMode.SNAPSHOT_RESTORE])
+async def test_catalog_recovery_precedes_harness_start(tmp_path, monkeypatch, harness, mode):
+    events = []
+    supervisor, *_ = _supervisor(tmp_path, events)
+    supervisor.config = replace(supervisor.config, session_config={"harness": harness})
+    monkeypatch.delenv("IMAGE_BUILD_MODE", raising=False)
+    monkeypatch.setenv("FROM_REPO_IMAGE", str(mode is BootMode.REPO_IMAGE).lower())
+    monkeypatch.setenv("RESTORED_FROM_SNAPSHOT", str(mode is BootMode.SNAPSHOT_RESTORE).lower())
+    supervisor_module.ensure_model_catalog.side_effect = lambda *_args, **_kwargs: (
+        events.append("catalog") or False
+    )
+
+    # A failed recovery is nonfatal, but always finishes before a turn can start.
+    assert await supervisor.run() is True
+    if harness == "claude":
+        supervisor_module.ensure_model_catalog.assert_not_awaited()
+    else:
+        assert events.index("catalog") < events.index("opencode") < events.index("bridge")
+
+
+@pytest.mark.parametrize("mode", [BootMode.FRESH, BootMode.REPO_IMAGE, BootMode.SNAPSHOT_RESTORE])
+async def test_harness_starts_from_this_boots_repositories(tmp_path, monkeypatch, mode):
+    """The Claude stager derives its start directory from these on every boot mode."""
+    supervisor, repository, harness_process, *_ = _supervisor(tmp_path, [])
+    supervisor.config = replace(supervisor.config, session_config={"harness": "claude"})
+    repos = tuple(
+        RepoEntry(owner="acme", name=name, branch="main", path=tmp_path / name)
+        for name in ("api", "web")
+    )
+    result = RepositoryBootResult(True, [], True, True, repos, tmp_path)
+    repository.boot.side_effect = None
+    repository.boot.return_value = result
+    monkeypatch.delenv("IMAGE_BUILD_MODE", raising=False)
+    monkeypatch.setenv("FROM_REPO_IMAGE", str(mode is BootMode.REPO_IMAGE).lower())
+    monkeypatch.setenv("RESTORED_FROM_SNAPSHOT", str(mode is BootMode.SNAPSHOT_RESTORE).lower())
+
+    assert await supervisor.run() is True
+    repository.boot.assert_awaited_once()
+    assert repository.boot.await_args.args[0] is mode
+    harness_process.start.assert_awaited_once_with(repos, tmp_path)
+
+
 async def test_graceful_bridge_exit_requests_shutdown(tmp_path):
     supervisor, _repository, _opencode_server, agent_bridge, *_ = _supervisor(tmp_path, [])
     agent_bridge.exit_code.return_value = 0
@@ -179,14 +331,14 @@ async def test_bridge_restart_exhaustion_is_fatal(tmp_path, monkeypatch):
     assert supervisor.shutdown_event.is_set()
 
 
-async def test_opencode_restarts_do_not_rematerialize_managed_skills(tmp_path, monkeypatch):
+async def test_opencode_restarts_do_not_rematerialize_managed_skills(tmp_path):
     supervisor, _repository, opencode_server, *_ = _supervisor(tmp_path, [])
     supervisor._repository_boot_result = RepositoryBootResult(True, [], True, True, (), tmp_path)
     opencode_server.exit_code.return_value = 1
     supervisor._report_fatal_error = AsyncMock()
-    monkeypatch.setattr("sandbox_runtime.supervisor.asyncio.sleep", AsyncMock())
+    supervisor._wait_for_shutdown = AsyncMock(return_value=False)
 
-    await SandboxSupervisor.monitor_processes(supervisor)
+    await asyncio.wait_for(SandboxSupervisor.monitor_processes(supervisor), timeout=1)
 
     assert opencode_server.start.await_count == supervisor.MAX_RESTARTS
     supervisor.managed_skills.materialize.assert_not_awaited()
@@ -207,3 +359,249 @@ async def test_code_server_restart_exhaustion_is_nonfatal(tmp_path, monkeypatch)
     await SandboxSupervisor.monitor_processes(supervisor)
 
     supervisor._report_fatal_error.assert_not_awaited()
+
+
+def _docker_service(events, *, prepare_error=None):
+    service = MagicMock()
+    service.exit_expected = False
+    exited = asyncio.Event()
+
+    async def start():
+        events.append("docker:start")
+
+    async def wait():
+        await exited.wait()
+        return 137
+
+    async def prepare_for_snapshot():
+        events.append("docker:prepare")
+        if prepare_error is not None:
+            raise prepare_error
+        service.exit_expected = True
+
+    async def stop():
+        events.append("docker:stop")
+        service.exit_expected = True
+        exited.set()
+
+    service.start = AsyncMock(side_effect=start)
+    service.wait = AsyncMock(side_effect=wait)
+    service.prepare_for_snapshot = AsyncMock(side_effect=prepare_for_snapshot)
+    service.stop = AsyncMock(side_effect=stop)
+    service.exited = exited
+    return service
+
+
+def _docker_supervisor(tmp_path, events, monkeypatch, **service_kwargs):
+    supervisor, repository, *rest = _supervisor(tmp_path, events)
+    supervisor.config = RuntimeConfig.from_env(
+        {
+            "SANDBOX_ID": "sandbox-1",
+            "REPO_OWNER": "acme",
+            "REPO_NAME": "repo",
+            "OPENINSPECT_DOCKER_ENABLED": "true",
+        },
+        workspace_path=tmp_path,
+    )
+    supervisor.docker_service = _docker_service(events, **service_kwargs)
+    return supervisor, repository, *rest
+
+
+async def test_docker_starts_before_repository_boot_and_stops_last(tmp_path, monkeypatch):
+    events = []
+    supervisor, *_ = _docker_supervisor(tmp_path, events, monkeypatch)
+    monkeypatch.delenv("IMAGE_BUILD_MODE", raising=False)
+    monkeypatch.delenv("RESTORED_FROM_SNAPSHOT", raising=False)
+    monkeypatch.delenv("FROM_REPO_IMAGE", raising=False)
+
+    assert await supervisor.run() is True
+
+    assert events[:3] == ["docker:start", "desktop", "repository:fresh"]
+    assert events[-1] == "docker:stop"
+
+
+async def test_standard_boot_never_touches_docker(tmp_path, monkeypatch):
+    events = []
+    supervisor, *_ = _supervisor(tmp_path, events)
+    monkeypatch.delenv("IMAGE_BUILD_MODE", raising=False)
+    monkeypatch.delenv("RESTORED_FROM_SNAPSHOT", raising=False)
+    monkeypatch.delenv("FROM_REPO_IMAGE", raising=False)
+
+    assert await supervisor.run() is True
+
+    assert supervisor.docker_service is None
+    assert not any(event.startswith("docker:") for event in events)
+
+
+async def test_docker_required_but_unconfigured_is_fatal(tmp_path, monkeypatch):
+    events = []
+    supervisor, *_ = _docker_supervisor(tmp_path, events, monkeypatch)
+    supervisor.docker_service = None
+    supervisor._report_fatal_error = AsyncMock()
+    monkeypatch.delenv("IMAGE_BUILD_MODE", raising=False)
+
+    assert await supervisor.run() is False
+
+    supervisor._report_fatal_error.assert_awaited_once()
+    assert "Docker service is not configured" in supervisor._report_fatal_error.await_args.args[0]
+    assert "repository:fresh" not in events
+
+
+async def test_build_starts_docker_before_hooks_and_prepares_it_before_success(
+    tmp_path, monkeypatch
+):
+    events = []
+    supervisor, *_ = _docker_supervisor(tmp_path, events, monkeypatch)
+    monkeypatch.setenv("IMAGE_BUILD_MODE", "true")
+    callback = MagicMock()
+
+    async def report_success(**_kwargs):
+        events.append("success")
+        assert supervisor._docker_watch_task is None
+        supervisor.shutdown_event.set()
+        return True
+
+    callback.report_success = AsyncMock(side_effect=report_success)
+    callback.report_failure = AsyncMock()
+
+    assert await supervisor.run(callback) is True
+
+    assert events == [
+        "docker:start",
+        "repository:build",
+        "docker:prepare",
+        "success",
+        "docker:stop",
+    ]
+
+
+@pytest.mark.parametrize(
+    "error", [RuntimeError("did not stop cleanly"), RuntimeError("clean shutdown deadline")]
+)
+async def test_build_preparation_failure_is_reported_as_a_failed_build(
+    tmp_path, monkeypatch, error
+):
+    events = []
+    supervisor, *_ = _docker_supervisor(tmp_path, events, monkeypatch, prepare_error=error)
+    monkeypatch.setenv("IMAGE_BUILD_MODE", "true")
+    supervisor._report_fatal_error = AsyncMock()
+    callback = MagicMock()
+    callback.report_success = AsyncMock()
+    callback.report_failure = AsyncMock()
+
+    assert await supervisor.run(callback) is False
+
+    callback.report_success.assert_not_awaited()
+    callback.report_failure.assert_awaited_once()
+    assert callback.report_failure.await_args.args[0]
+    assert supervisor.docker_service.stop.await_count == 1
+
+
+@pytest.mark.parametrize("reported", [True, False])
+async def test_daemon_exit_during_build_hooks_fails_the_build(tmp_path, monkeypatch, reported):
+    events = []
+    supervisor, repository, *_ = _docker_supervisor(tmp_path, events, monkeypatch)
+    monkeypatch.setenv("IMAGE_BUILD_MODE", "true")
+    supervisor._report_fatal_error = AsyncMock()
+    callback = MagicMock()
+    callback.report_success = AsyncMock()
+    callback.report_failure = AsyncMock()
+    # A zero fatal-report bound must not cancel the separate build callback policy.
+    monkeypatch.setattr("sandbox_runtime.supervisor.FATAL_ERROR_REPORT_TIMEOUT_SECONDS", 0)
+
+    async def report_failure(_error):
+        await asyncio.sleep(0)
+        events.append("failure:reported")
+        return reported
+
+    callback.report_failure.side_effect = report_failure
+
+    async def boot(_mode, _ports):
+        events.append("repository:build")
+        supervisor.docker_service.exited.set()
+        await asyncio.Event().wait()
+
+    repository.boot = AsyncMock(side_effect=boot)
+
+    assert await supervisor.run(callback) is False
+
+    callback.report_success.assert_not_awaited()
+    callback.report_failure.assert_awaited_once()
+    assert "exited unexpectedly" in callback.report_failure.await_args.args[0]
+    supervisor._report_fatal_error.assert_awaited_once()
+    assert "failure:reported" in events
+    if not reported:
+        supervisor.log.error.assert_any_call("image_build.failure_report_failed")
+
+
+async def test_daemon_exit_during_session_is_fatal(tmp_path, monkeypatch):
+    events = []
+    supervisor, *_ = _docker_supervisor(tmp_path, events, monkeypatch)
+    monkeypatch.delenv("IMAGE_BUILD_MODE", raising=False)
+    supervisor._report_fatal_error = AsyncMock()
+
+    async def monitor():
+        supervisor.docker_service.exited.set()
+        await supervisor.shutdown_event.wait()
+
+    supervisor.monitor_processes = AsyncMock(side_effect=monitor)
+
+    assert await supervisor.run() is False
+
+    supervisor._report_fatal_error.assert_awaited_once()
+    assert "exited unexpectedly" in supervisor._report_fatal_error.await_args.args[0]
+
+
+async def test_requested_shutdown_during_docker_start_is_not_a_failure(tmp_path, monkeypatch):
+    events = []
+    supervisor, *_ = _docker_supervisor(tmp_path, events, monkeypatch)
+    monkeypatch.setenv("IMAGE_BUILD_MODE", "true")
+    callback = MagicMock()
+    callback.report_success = AsyncMock()
+    callback.report_failure = AsyncMock()
+
+    async def start():
+        supervisor.shutdown_event.set()
+        await asyncio.Event().wait()
+
+    supervisor.docker_service.start = AsyncMock(side_effect=start)
+
+    assert await supervisor.run(callback) is True
+
+    callback.report_success.assert_not_awaited()
+    callback.report_failure.assert_not_awaited()
+
+
+async def test_daemon_exit_during_interactive_boot_is_fatal(tmp_path, monkeypatch):
+    events = []
+    supervisor, repository, *_ = _docker_supervisor(tmp_path, events, monkeypatch)
+    monkeypatch.delenv("IMAGE_BUILD_MODE", raising=False)
+    supervisor._report_fatal_error = AsyncMock()
+
+    async def boot(_mode, _ports):
+        supervisor.docker_service.exited.set()
+        await asyncio.Event().wait()
+
+    repository.boot = AsyncMock(side_effect=boot)
+
+    assert await supervisor.run() is False
+
+    supervisor._report_fatal_error.assert_awaited_once()
+    assert "exited unexpectedly" in supervisor._report_fatal_error.await_args.args[0]
+
+
+async def test_requested_shutdown_with_docker_running_is_not_a_failure(tmp_path, monkeypatch):
+    events = []
+    supervisor, *_ = _docker_supervisor(tmp_path, events, monkeypatch)
+    monkeypatch.delenv("IMAGE_BUILD_MODE", raising=False)
+    supervisor._report_fatal_error = AsyncMock()
+
+    async def monitor():
+        supervisor.request_shutdown(signal.SIGTERM)
+
+    supervisor.monitor_processes = AsyncMock(side_effect=monitor)
+
+    assert await supervisor.run() is True
+
+    supervisor._report_fatal_error.assert_not_awaited()
+    assert events[-1] == "docker:stop"

@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import contextlib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .boot_events import BootPhaseError, BootPhaseName, PhaseScope
 from .constants import REPO_MANIFEST_FILE_PATH
-from .repo_config import RepoConfigError, RepoEntry, dump_repo_manifest, parse_repositories
+from .repo_config import (
+    RepoConfigError,
+    RepoEntry,
+    dump_repo_manifest,
+    load_repo_manifest,
+    parse_repositories,
+)
 from .repository_sync import RepositorySyncStatus
 from .runtime_config import BootMode, RepositoryConfig
 
@@ -18,6 +24,18 @@ if TYPE_CHECKING:
     from .repository_hooks import RepositoryHooks
     from .repository_sync import RepositorySynchronizer
     from .tunnel_environment import TunnelEnvironment
+
+
+# Per-repository instructions the workspace manifest points at, in the names
+# the supported harnesses read natively. A harness that starts outside a
+# member may never load them on its own.
+INSTRUCTION_PATHS = (
+    "AGENTS.md",
+    "CLAUDE.md",
+    ".claude/AGENTS.md",
+    ".claude/CLAUDE.md",
+    ".claude/rules",
+)
 
 
 @dataclass(frozen=True)
@@ -86,11 +104,45 @@ class RepositoryBoot:
             return self.repo_path
         return self.workspace_path
 
+    def _adopt_persisted_base_shas(self) -> None:
+        """Keep the session-start commits an earlier boot of this disk discovered.
+
+        A restored checkout skips baseline discovery (HEAD may have moved), and
+        a provider that resumes with the create-time env hands over no base SHA
+        at all. The manifest the previous boot wrote carries the SHAs it found
+        after cloning; a repository that arrives without one takes it from
+        there. One it arrives with is kept.
+        """
+        persisted = {
+            (entry.owner.lower(), entry.name.lower()): entry.base_sha
+            for entry in load_repo_manifest(REPO_MANIFEST_FILE_PATH)
+            if entry.base_sha
+        }
+        if not persisted:
+            return
+        self.repositories = [
+            replace(entry, base_sha=persisted.get((entry.owner.lower(), entry.name.lower())))
+            if entry.base_sha is None
+            else entry
+            for entry in self.repositories
+        ]
+
     def _write_repo_manifest(self) -> None:
         try:
             Path(REPO_MANIFEST_FILE_PATH).write_text(dump_repo_manifest(self.repositories))
         except Exception as error:
             self.log.warn("supervisor.repo_manifest_write_failed", exc=error)
+
+    def _instruction_entry(self, path: Path) -> str | None:
+        # A committed .claude symlink can point somewhere the sandbox user
+        # can't search; one unreadable entry must not fail the boot.
+        try:
+            if not path.exists():
+                return None
+            return str(path) + ("/" if path.is_dir() else "")
+        except OSError as error:
+            self.log.warn("workspace.instruction_path_unreadable", path=str(path), exc=error)
+            return None
 
     def _write_workspace_manifest(self) -> None:
         if not self.is_multi_repo:
@@ -101,7 +153,8 @@ class RepositoryBoot:
             "",
             "# Workspace",
             "",
-            "This session spans multiple repositories, checked out side by side:",
+            f"This session spans multiple repositories, checked out side by side in "
+            f"`{self.workspace_path}` (table paths are relative to it):",
             "",
             "| Path | Repository | Base branch |",
             "| --- | --- | --- |",
@@ -116,14 +169,21 @@ class RepositoryBoot:
             lines.extend(
                 [f"All work happens on the branch `{working_branch}` in every repository.", ""]
             )
-        member_docs = [repo for repo in self.repositories if (repo.path / "AGENTS.md").exists()]
+        member_docs = [
+            entry
+            for repo in self.repositories
+            for name in INSTRUCTION_PATHS
+            if (entry := self._instruction_entry(repo.path / name)) is not None
+        ]
         if member_docs:
             lines.extend(
                 [
-                    "Repository-specific instructions are NOT loaded automatically. "
-                    "Read them before working in a repository:",
+                    "Each repository's own instructions may not be loaded for you. Before "
+                    "working in a repository, read its entries below unless they are already "
+                    "in your context. A trailing `/` is a directory of rule files; a rule "
+                    "with `paths` frontmatter applies only to the files it matches:",
                     "",
-                    *(f"- `./{repo.name}/AGENTS.md`" for repo in member_docs),
+                    *(f"- `{doc}`" for doc in member_docs),
                     "",
                 ]
             )
@@ -166,6 +226,8 @@ class RepositoryBoot:
     ) -> RepositoryBootResult:
         if self.repo_config_error:
             raise RuntimeError(f"invalid repository config: {self.repo_config_error}")
+        if boot_mode is BootMode.SNAPSHOT_RESTORE:
+            self._adopt_persisted_base_shas()
         self._write_repo_manifest()
         with self._phase(boot_mode, "sync") as sync_phase:
             if self.repositories:

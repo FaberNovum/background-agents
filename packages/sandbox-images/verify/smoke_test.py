@@ -112,19 +112,7 @@ class Probe:
                             **self.options,
                         )
                     )
-                deadline = time.monotonic() + 20
-                while True:
-                    if any(process.poll() is not None for process in processes):
-                        raise RuntimeError("Desktop process exited during verification")
-                    try:
-                        with socket.create_connection(("127.0.0.1", port), timeout=1) as connection:
-                            if not connection.recv(12).startswith(b"RFB "):
-                                raise RuntimeError("VNC server did not speak RFB")
-                            break
-                    except OSError:
-                        if time.monotonic() > deadline:
-                            raise RuntimeError("VNC readiness timeout") from None
-                        time.sleep(0.1)
+                wait_for_rfb(port, processes, deadline=time.monotonic() + 20)
                 self.service(
                     [
                         "websockify",
@@ -175,6 +163,46 @@ class Probe:
                 stop_process(process)
 
 
+def wait_for_rfb(port: int, processes: list[subprocess.Popen], *, deadline: float) -> None:
+    """Wait for the VNC server on ``port`` to send its RFB banner.
+
+    Reconnects only while nothing is listening. Once connected, one connection
+    waits out the deadline: the kernel accepts connections before x11vnc does,
+    and abandoning a connection x11vnc has not yet picked up only queues it
+    ahead of the next attempt. The desktop processes are checked throughout the
+    wait and again once the banner arrives.
+    """
+
+    def require_processes_running() -> None:
+        if any(process.poll() is not None for process in processes):
+            raise RuntimeError("Desktop process exited during verification")
+
+    while True:
+        require_processes_running()
+        try:
+            connection = socket.create_connection(("127.0.0.1", port), timeout=1)
+        except OSError:
+            if time.monotonic() > deadline:
+                raise RuntimeError("VNC readiness timeout") from None
+            time.sleep(0.1)
+            continue
+        with connection:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError("VNC readiness timeout")
+                connection.settimeout(min(remaining, 0.5))
+                try:
+                    banner = connection.recv(12)
+                    break
+                except TimeoutError:
+                    require_processes_running()
+        require_processes_running()
+        if not banner.startswith(b"RFB "):
+            raise RuntimeError("VNC server did not speak RFB")
+        return
+
+
 def verify_rfb_proxy(port: int) -> None:
     """Require the WebSocket proxy to exchange RFB with its VNC backend."""
     from websockets.sync.client import connect
@@ -213,11 +241,13 @@ def observed_tool_version(command: str, expected: str, output: str) -> str:
     prefixes = {
         "node": r"v",
         "opencode": r"",
+        "codex": r"codex-cli ",
         "bun": r"",
         "pnpm": r"",
         "agent-browser": r"agent-browser\s+",
         "code-server": r"",
         "ttyd": r"ttyd version\s+",
+        "rg": r"ripgrep\s+",
         "google-chrome": r"Google Chrome(?: for Testing)?\s+",
     }
     # ttyd's pinned release appends its source commit, not a prerelease label.
@@ -237,11 +267,13 @@ def inspect_image(plan: dict[str, Any], tools: dict[str, Any], *, services: bool
     for command, version in (
         ("node", tools["node"][plan["target"]["node"]]["version"]),
         ("opencode", tools["opencode"]),
+        ("codex", tools["codex"]["version"]),
         ("bun", tools["bun"]),
         ("pnpm", tools["pnpm"]),
         ("agent-browser", tools["agentBrowser"]),
         ("code-server", tools["codeServer"]["version"]),
         ("ttyd", tools["ttyd"]["version"]),
+        ("rg", tools["ripgrep"]["version"]),
         ("google-chrome", tools["chrome"]["version"]),
     ):
         observed = probe.run([command, "--version"])
@@ -256,6 +288,9 @@ def inspect_image(plan: dict[str, Any], tools: dict[str, Any], *, services: bool
     )
     if installed_runtime != plan["runtimeVersion"]:
         raise RuntimeError("Installed runtime manifest does not match the recipe")
+    probe.run(["python3", "-m", "sandbox_runtime.harness.codex.probe"], timeout_seconds=30)
+    # Offline: a refreshed cache in the build sandbox is not proof it survived capture.
+    probe.run(["python3", "-m", "sandbox_runtime.model_catalog", "--check"])
     probe.run(
         [
             "python3",

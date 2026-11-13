@@ -6,6 +6,8 @@ import {
   SCOPED_PERMISSION_PAIRS,
   effectiveAuthorizationSchema,
   hasScopedPermission,
+  isCustomRolePermission,
+  memberMergeInputSchema,
   permissionsForBuiltInRole,
   resolveScopedPermission,
   replaceMemberRoleInputSchema,
@@ -61,7 +63,7 @@ describe("RBAC registry", () => {
   });
 
   it("contains unique, sorted permission identifiers", () => {
-    expect(PERMISSION_IDS).toHaveLength(44);
+    expect(PERMISSION_IDS).toHaveLength(48);
     expect(new Set(PERMISSION_IDS).size).toBe(PERMISSION_IDS.length);
     expect(PERMISSION_IDS).toEqual([...PERMISSION_IDS].sort());
   });
@@ -101,6 +103,34 @@ describe("RBAC registry", () => {
     }
   });
 
+  it("grants member merges to Owner, Administrator, and eligible custom roles", () => {
+    for (const role of ["owner", "administrator"] as const) {
+      expect(permissionsForBuiltInRole(role)).toContain("workspace.personal_access_tokens.manage");
+    }
+    for (const role of ["member", "viewer"] as const) {
+      expect(permissionsForBuiltInRole(role)).not.toContain(
+        "workspace.personal_access_tokens.manage"
+      );
+    }
+    expect(isCustomRolePermission("workspace.personal_access_tokens.manage")).toBe(true);
+    expect(permissionsForBuiltInRole("owner")).toContain("workspace.members.merge");
+    expect(permissionsForBuiltInRole("administrator")).toContain("workspace.members.merge");
+    expect(permissionsForBuiltInRole("member")).not.toContain("workspace.members.merge");
+    expect(permissionsForBuiltInRole("viewer")).not.toContain("workspace.members.merge");
+    expect(isCustomRolePermission("workspace.members.merge")).toBe(true);
+  });
+
+  it("rejects a member merge into the same user", () => {
+    const userId = "a".repeat(32);
+    expect(
+      memberMergeInputSchema.safeParse({ sourceUserId: userId, targetUserId: userId }).success
+    ).toBe(false);
+    expect(
+      memberMergeInputSchema.safeParse({ sourceUserId: userId, targetUserId: "b".repeat(32) })
+        .success
+    ).toBe(true);
+  });
+
   it("grants Members workspace-wide session operations", () => {
     const permissions = permissionsForBuiltInRole("member");
     expect(permissions).toEqual(
@@ -132,6 +162,15 @@ describe("RBAC registry", () => {
     expect(permissionsForBuiltInRole("administrator")).toContain("sessions.bulk_archive");
     expect(permissionsForBuiltInRole("member")).not.toContain("sessions.bulk_archive");
     expect(permissionsForBuiltInRole("viewer")).not.toContain("sessions.bulk_archive");
+  });
+
+  it("reserves session export for Owner, Administrator, and eligible custom roles", () => {
+    expect(PERMISSION_IDS).toContain("sessions.export");
+    expect(permissionsForBuiltInRole("owner")).toContain("sessions.export");
+    expect(permissionsForBuiltInRole("administrator")).toContain("sessions.export");
+    expect(permissionsForBuiltInRole("member")).not.toContain("sessions.export");
+    expect(permissionsForBuiltInRole("viewer")).not.toContain("sessions.export");
+    expect(isCustomRolePermission("sessions.export")).toBe(true);
   });
 
   it("makes Member a superset of Viewer", () => {

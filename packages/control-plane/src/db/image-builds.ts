@@ -1,14 +1,18 @@
 import {
+  imageBuildScopeKindSchema,
+  imageBuildStatusSchema,
   type ImageBuildRecordView,
   type ImageBuildScopeKind,
   type ImageBuildStatus,
   type RepositoryShaEntry,
 } from "@open-inspect/shared/types/image-builds";
-import type {
-  ImageBuildProvider,
-  ImageBuildScope,
-  MarkImageBuildReadyResult,
-  SupersededImageBuild,
+import { z } from "zod";
+import {
+  imageBuildProviderSchema,
+  type ImageBuildProvider,
+  type ImageBuildScope,
+  type MarkImageBuildReadyResult,
+  type SupersededImageBuild,
 } from "../image-builds/model";
 import { ImageBuildFinalizationStore } from "./image-build-finalization";
 import type { SqlDatabase } from "./sql-database";
@@ -79,6 +83,20 @@ interface ImageBuildStatusRow {
   created_at: number;
 }
 
+const imageBuildStatusRowSchema = z.object({
+  id: z.string(),
+  scope_kind: imageBuildScopeKindSchema,
+  scope_id: z.string(),
+  provider: imageBuildProviderSchema,
+  status: imageBuildStatusSchema,
+  repositories_fingerprint: z.string(),
+  repository_shas: z.string(),
+  runtime_version: z.string(),
+  build_duration_seconds: z.number().nullable(),
+  error_message: z.string().nullable(),
+  created_at: z.number(),
+});
+
 function toImageBuildRecordView(row: ImageBuildStatusRow): ImageBuildRecordView {
   return {
     id: row.id,
@@ -93,6 +111,13 @@ function toImageBuildRecordView(row: ImageBuildStatusRow): ImageBuildRecordView 
     errorMessage: row.error_message,
     createdAt: row.created_at,
   };
+}
+
+function parseImageBuildStatusRows(rows: unknown[] | undefined): ImageBuildStatusRow[] {
+  return (rows ?? []).flatMap((row) => {
+    const parsed = imageBuildStatusRowSchema.safeParse(row);
+    return parsed.success ? [parsed.data] : [];
+  });
 }
 
 /**
@@ -156,6 +181,8 @@ export interface UnresolvedProviderOperationRow {
   provider: ImageBuildProvider;
   provider_session_id: string | null;
   provider_operation_ref: string;
+  /** Fixed wall-clock deadline (ms) the reservation recorded; null before it existed. */
+  provider_operation_deadline_at: number | null;
   created_at: number;
 }
 
@@ -200,7 +227,7 @@ export const UNBOUND_SOURCE_INTENTS_SQL = `SELECT id, provider, created_at
  * still listed here is an obligation nothing else on the row records.
  */
 export const UNRESOLVED_PROVIDER_OPERATIONS_SQL = `SELECT id, provider, provider_session_id,
-        provider_operation_ref, created_at
+        provider_operation_ref, provider_operation_deadline_at, created_at
  FROM image_builds
  WHERE status IN ('failed', 'superseded')
    AND provider_operation_ref IS NOT NULL
@@ -799,7 +826,7 @@ export class ImageBuildStore {
       .bind(scope.kind, scope.id)
       .all<ImageBuildStatusRow>();
 
-    return (result.results || []).map(toImageBuildRecordView);
+    return parseImageBuildStatusRows(result.results).map(toImageBuildRecordView);
   }
 
   /**
@@ -821,7 +848,7 @@ export class ImageBuildStore {
       .bind(scope.kind, scope.id, provider)
       .all<ImageBuildStatusRow>();
 
-    return (result.results || []).map(toImageBuildRecordView);
+    return parseImageBuildStatusRows(result.results).map(toImageBuildRecordView);
   }
 
   /**
@@ -853,7 +880,7 @@ export class ImageBuildStore {
           )
           .bind(kind, ...chunk)
           .all<ImageBuildStatusRow>();
-        rows.push(...(result.results || []).map(toImageBuildRecordView));
+        rows.push(...parseImageBuildStatusRows(result.results).map(toImageBuildRecordView));
       }
     }
 

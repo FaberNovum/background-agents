@@ -44,7 +44,7 @@ Next.js web application for interacting with Open-Inspect coding sessions.
 
 ### Prerequisites
 
-- Node.js 22+
+- Node.js 24+
 - A deployed control plane with at least one sign-in provider
 - GitHub App repository credentials configured on the control plane
 
@@ -108,6 +108,31 @@ npm run build
 ```
 
 ## Pages
+
+### Mermaid Rendering
+
+Assistant messages render explicitly closed Mermaid fences. CommonMark parser events mark
+completion, including fences in lists and blockquotes; incomplete input remains readable code.
+
+Mermaid executes only in an opaque-origin iframe, not in the authenticated application document.
+`npm run dev`, `npm run build`, and `npm run build:cloudflare` generate the self-contained
+`public/mermaid-renderer.html` asset. Use these commands rather than invoking `next build` directly.
+The asset is generated, not checked in, and is copied with the other public assets by both Next.js
+and OpenNext. Next.js also sends a sandbox CSP header for direct navigation to the asset.
+
+The generated document's hash-based CSP permits only its trusted renderer bundle, inline styling,
+and data images. External resources and connections are blocked during parsing, measurement, and
+drawing. Requests and results travel over a private MessageChannel; the parent accepts only SVG
+image data URLs with valid dimensions. SVG output is separately sanitized, and diagrams requiring
+removed HTML/image content fall back to source. Timed-out frames are discarded so later work can
+recover. This is a DOM/origin/resource boundary, not a separate CPU process guarantee.
+
+Browser security coverage requires Chromium and exercises the actual generated asset:
+
+```bash
+# Optional: set CHROME_BIN to the Chromium executable.
+npm run test:mermaid-browser -w @open-inspect/web
+```
 
 ### Dashboard (`/`)
 

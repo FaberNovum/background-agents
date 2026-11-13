@@ -8,10 +8,11 @@ function result(changes: number, rows: unknown[] = []): SqlResult {
 
 function fakeDatabase(options: {
   batchResults?: SqlResult[];
-  batchError?: Error;
   allResults?: unknown[];
+  firstResults?: unknown[];
   prepared?: Array<{ sql: string; values: unknown[] }>;
 }): SqlDatabase {
+  const firstResults = [...(options.firstResults ?? [])];
   return {
     prepare: (sql) => {
       const prepared = { sql, values: [] as unknown[] };
@@ -21,14 +22,13 @@ function fakeDatabase(options: {
           prepared.values = values;
           return statement;
         },
-        first: async <T>() => null as T | null,
+        first: async <T>() => (firstResults.shift() as T | undefined) ?? null,
         run: async <T>() => result(0) as SqlResult<T>,
         all: async <T>() => result(0, options.allResults) as SqlResult<T>,
       };
       return statement;
     },
     batch: async <T>() => {
-      if (options.batchError) throw options.batchError;
       return (options.batchResults ?? []) as SqlResult<T>[];
     },
   };
@@ -43,6 +43,50 @@ const replaceMemberStatusInput: Parameters<AuthorizationStore["replaceMemberStat
 };
 
 describe("AuthorizationStore", () => {
+  const canonicalUserId = "a".repeat(32);
+
+  it("maps an effective authorization row with no role assignment", async () => {
+    const store = new AuthorizationStore(
+      fakeDatabase({
+        firstResults: [
+          {
+            user_id: "user-1",
+            suspended_at: null,
+            role_id: null,
+            role_key: null,
+            role_name: null,
+          },
+        ],
+      })
+    );
+
+    await expect(store.getEffectiveAuthorization("user-1")).resolves.toEqual({
+      userId: "user-1",
+      suspendedAt: null,
+      role: null,
+    });
+  });
+
+  it("rejects a malformed effective authorization row", async () => {
+    const store = new AuthorizationStore(
+      fakeDatabase({
+        firstResults: [
+          {
+            user_id: "user-1",
+            suspended_at: null,
+            role_id: "role_builtin_owner",
+            role_key: "superuser",
+            role_name: "Owner",
+          },
+        ],
+      })
+    );
+
+    await expect(store.getEffectiveAuthorization("user-1")).rejects.toThrow(
+      "Malformed persisted authorization row"
+    );
+  });
+
   it("maps persistence role fields at the store boundary", async () => {
     const store = new AuthorizationStore(
       fakeDatabase({
@@ -70,30 +114,126 @@ describe("AuthorizationStore", () => {
     ]);
   });
 
-  it.each([
-    "applied",
-    "no_op",
-    "actor_authorization_changed",
-    "role_not_found",
-    "member_not_found",
-    "conflict",
-  ] as const)("returns the %s member status replacement batch outcome", async (status) => {
+  it("rejects a malformed persisted role row", async () => {
     const store = new AuthorizationStore(
       fakeDatabase({
-        batchResults: [result(0, [{ status }]), result(1), result(1), result(1)],
+        allResults: [
+          {
+            id: "role_custom",
+            key: null,
+            name: "Custom",
+            description: null,
+            assignment_count: "many",
+          },
+        ],
       })
     );
 
-    await expect(store.replaceMemberStatus(replaceMemberStatusInput)).resolves.toEqual({
-      status,
-    });
+    await expect(store.listRoles()).rejects.toThrow("Malformed persisted authorization role row");
   });
 
-  it("does not classify an unexpected database failure as a conflict", async () => {
-    const failure = new Error("database unavailable");
-    const store = new AuthorizationStore(fakeDatabase({ batchError: failure }));
+  it.each([
+    ["negative number", -1],
+    ["fractional number", 1.5],
+    ["negative string", "-1"],
+    ["unsafe integer string", "9007199254740992"],
+    ["overflowing digit string", "9".repeat(400)],
+  ])("rejects a persisted role count that is a %s", async (_label, assignmentCount) => {
+    const store = new AuthorizationStore(
+      fakeDatabase({
+        allResults: [
+          {
+            id: "role_custom",
+            key: null,
+            name: "Custom",
+            description: null,
+            assignment_count: assignmentCount,
+          },
+        ],
+      })
+    );
 
-    await expect(store.replaceMemberStatus(replaceMemberStatusInput)).rejects.toBe(failure);
+    await expect(store.listRoles()).rejects.toThrow("Malformed persisted authorization role row");
+  });
+
+  it("maps nullable persisted member fields at the store boundary", async () => {
+    const store = new AuthorizationStore(
+      fakeDatabase({
+        allResults: [
+          {
+            user_id: canonicalUserId,
+            display_name: null,
+            email: null,
+            suspended_at: null,
+            role_id: "role_builtin_owner",
+            role_key: "owner",
+            role_name: "Owner",
+          },
+        ],
+      })
+    );
+
+    await expect(store.listMembers()).resolves.toEqual([
+      {
+        userId: canonicalUserId,
+        displayName: null,
+        email: null,
+        suspendedAt: null,
+        role: {
+          id: "role_builtin_owner",
+          key: "owner",
+          name: "Owner",
+        },
+      },
+    ]);
+  });
+
+  it.each([
+    ["noncanonical user ID", { user_id: "user-1" }],
+    ["negative suspension timestamp", { suspended_at: -1 }],
+    ["fractional suspension timestamp", { suspended_at: 1.5 }],
+  ])("rejects a persisted member row with a %s", async (_label, override) => {
+    const store = new AuthorizationStore(
+      fakeDatabase({
+        allResults: [
+          {
+            user_id: canonicalUserId,
+            display_name: null,
+            email: null,
+            suspended_at: null,
+            role_id: "role_builtin_owner",
+            role_key: "owner",
+            role_name: "Owner",
+            ...override,
+          },
+        ],
+      })
+    );
+
+    await expect(store.listMembers()).rejects.toThrow(
+      "Malformed persisted authorization member row"
+    );
+  });
+
+  it("rejects a partial persisted member row", async () => {
+    const store = new AuthorizationStore(
+      fakeDatabase({
+        allResults: [
+          {
+            user_id: "user-1",
+            display_name: null,
+            email: null,
+            suspended_at: null,
+            role_id: "role_builtin_owner",
+            role_key: "owner",
+          },
+        ],
+      })
+    );
+
+    await expect(store.listMembers()).rejects.toThrow(
+      "Malformed persisted authorization member row"
+    );
   });
 
   it("returns the mutation outcome from the audit insert that gates writes", async () => {

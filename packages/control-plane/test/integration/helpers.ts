@@ -4,7 +4,8 @@ import { handleControlPlaneHttp } from "../../src/cloudflare/http-host";
 import { runInSessionDO } from "./session-do-access";
 import type { SandboxSettings } from "@open-inspect/shared/types/integrations";
 import { buildServiceAuthHeaders, type ServiceName } from "@open-inspect/shared/service-auth";
-import { BUILT_IN_ROLE_REGISTRY, type BuiltInRoleKey } from "@open-inspect/shared/rbac";
+import type { BuiltInRoleKey } from "@open-inspect/shared/rbac";
+import { seedBrowserSession } from "../support/browser-session";
 import type { SandboxStatus } from "@open-inspect/shared/types/sessions";
 import type { SessionDO } from "../../src/cloudflare/durable-object";
 import { hashToken } from "../../src/auth/crypto";
@@ -57,11 +58,10 @@ export const INTEGRATION_WEBSOCKET_TIMEOUT_MS = 2000;
 const TEST_BROWSER_USER_ID = "11111111111111111111111111111111";
 const TEST_BROWSER_ACCOUNT_ID = "test-browser-account";
 const TEST_BROWSER_PROVIDER_SUBJECT = "583231";
-type InitialUserRole = Exclude<BuiltInRoleKey, "viewer">;
+type InitialUserRole = BuiltInRoleKey;
 const DEFAULT_INITIAL_USER_ROLE = "owner" as const;
 const TEST_BROWSER_SESSION_ID = "test-browser-session";
 const TEST_BROWSER_SESSION_TOKEN = "test-browser-session-token";
-const TEST_BROWSER_SESSION_COOKIE = "__Secure-openinspect.session_token";
 const TEST_NAMED_SESSION_DEFAULTS = {
   repoOwner: "acme",
   repoName: "web-app",
@@ -74,91 +74,33 @@ export const TEST_SESSION_PROVIDER_AUTH: SessionModelProviderAuthInput[] = [
   { provider: "anthropic", authMode: "api_key", selectionSource: "api_key_fallback" },
 ];
 
-async function signCookieValue(value: string, secret: string): Promise<string> {
-  const key = await crypto.subtle.importKey(
-    "raw",
-    new TextEncoder().encode(secret),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"]
-  );
-  const signature = new Uint8Array(
-    await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(value))
-  );
-  const signatureBase64 = btoa(String.fromCharCode(...signature));
-  return encodeURIComponent(`${value}.${signatureBase64}`);
-}
-
-/**
- * Seed one real Better Auth user/account/session and return its signed cookie.
- *
- * Integration route tests exercise browser-owned endpoints, so their default
- * web request must carry the same compound credential as production. Direct
- * service-auth tests intentionally build their own bare sig1 requests.
- */
-async function testBrowserSessionCookie(initialRole: InitialUserRole): Promise<string> {
+/** Seed a canonical Better Auth session; `as` signs in a distinct user with its own role. */
+async function testBrowserSessionCookie(
+  initialRole: InitialUserRole,
+  as?: { userId: string; role: BuiltInRoleKey }
+): Promise<string> {
   const secret = env.BROWSER_AUTH_SECRET;
   if (!secret) throw new Error("BROWSER_AUTH_SECRET is not configured for integration tests");
-
-  const now = new Date();
-  const expiresAt = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
-  const applicationTimestamp = now.getTime();
-  const existingUser = await env.DB.prepare("SELECT 1 FROM users WHERE id = ?")
-    .bind(TEST_BROWSER_USER_ID)
-    .first();
-  await env.DB.batch([
-    env.DB.prepare(
-      `INSERT OR IGNORE INTO users
-         (id, display_name, email, email_verified, avatar_url, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`
-    ).bind(
-      TEST_BROWSER_USER_ID,
-      "Integration Browser User",
-      "browser@test.local",
-      1,
-      "browser@test.local",
-      applicationTimestamp,
-      applicationTimestamp
-    ),
-    env.DB.prepare(
-      `INSERT OR IGNORE INTO user_identities
-         (id, user_id, provider, provider_user_id, provider_login, provider_email,
-          provider_issuer, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    ).bind(
-      TEST_BROWSER_ACCOUNT_ID,
-      TEST_BROWSER_USER_ID,
-      "github",
-      TEST_BROWSER_PROVIDER_SUBJECT,
-      null,
-      "browser@test.local",
-      "https://github.com",
-      applicationTimestamp,
-      applicationTimestamp
-    ),
-    env.DB.prepare(
-      `INSERT OR IGNORE INTO auth_sessions
-         (id, expiresAt, token, createdAt, updatedAt, ipAddress, userAgent, userId)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-    ).bind(
-      TEST_BROWSER_SESSION_ID,
-      expiresAt.getTime(),
-      TEST_BROWSER_SESSION_TOKEN,
-      applicationTimestamp,
-      applicationTimestamp,
-      "127.0.0.1",
-      "integration-test",
-      TEST_BROWSER_USER_ID
-    ),
-  ]);
-  if (initialRole !== "member" && !existingUser) {
-    await env.DB.prepare(`UPDATE user_role_assignments SET role_id = ? WHERE user_id = ?`)
-      .bind(BUILT_IN_ROLE_REGISTRY[initialRole].id, TEST_BROWSER_USER_ID)
-      .run();
-  }
-
-  const signedToken = await signCookieValue(TEST_BROWSER_SESSION_TOKEN, secret);
-  return `${TEST_BROWSER_SESSION_COOKIE}=${signedToken}`;
+  const nowMs = Date.now();
+  const email = as ? `${as.userId}@test.local` : "browser@test.local";
+  const { cookieHeader } = await seedBrowserSession(
+    sqlDatabase(env.DB),
+    { secret, publicWebOrigin: env.WEB_APP_URL! },
+    {
+      userId: as?.userId ?? TEST_BROWSER_USER_ID,
+      identityId: as ? `test-browser-account-${as.userId}` : TEST_BROWSER_ACCOUNT_ID,
+      providerSubject: as?.userId ?? TEST_BROWSER_PROVIDER_SUBJECT,
+      name: "Integration Browser User",
+      email,
+      avatarUrl: email,
+      role: as?.role ?? initialRole,
+      sessionId: as ? `test-browser-session-${as.userId}` : TEST_BROWSER_SESSION_ID,
+      token: as ? `test-browser-token-${as.userId}` : TEST_BROWSER_SESSION_TOKEN,
+      nowMs,
+      expiresAtMs: nowMs + 7 * 24 * 60 * 60 * 1000,
+    }
+  );
+  return cookieHeader;
 }
 
 /**
@@ -176,6 +118,9 @@ export interface ServiceRequestInit {
   service?: ServiceName;
   actor?: string;
   initialUserRole?: InitialUserRole;
+  as?: { userId: string; role: BuiltInRoleKey };
+  /** Defaults to following redirects, like `fetch`. */
+  redirect?: RequestInit["redirect"];
 }
 
 /**
@@ -198,7 +143,7 @@ export async function serviceRequestHeaders(
   });
   const browserCookie =
     service === "web"
-      ? await testBrowserSessionCookie(init?.initialUserRole ?? DEFAULT_INITIAL_USER_ROLE)
+      ? await testBrowserSessionCookie(init?.initialUserRole ?? DEFAULT_INITIAL_USER_ROLE, init?.as)
       : undefined;
   return {
     ...(init?.body === undefined ? {} : { "Content-Type": "application/json" }),
@@ -213,7 +158,28 @@ export async function serviceFetch(url: string, init?: ServiceRequestInit): Prom
     method: init?.method ?? DEFAULT_SERVICE_REQUEST_METHOD,
     headers: await serviceRequestHeaders(url, init),
     body: init?.body,
+    redirect: init?.redirect,
   });
+}
+
+/**
+ * Enroll a Slack actor the way the Slack bot does before any other request:
+ * `POST /actors/me` with its attested email. A new Slack actor is refused
+ * without one.
+ */
+export async function enrollSlackActor(
+  actor: `slack:${string}`,
+  email = `${actor.slice("slack:".length).toLowerCase()}@slack.test`
+): Promise<void> {
+  const response = await serviceFetch("https://test.local/actors/me", {
+    service: "slack-bot",
+    method: "POST",
+    actor,
+    body: JSON.stringify({ email }),
+  });
+  if (response.status !== 204) {
+    throw new Error(`Enrolling ${actor} failed with ${response.status}: ${await response.text()}`);
+  }
 }
 
 /** Create a production-shaped D1 session and DO, then return the stub and IDs. */
@@ -235,6 +201,7 @@ export async function initSession(overrides?: {
   reasoningEffort?: string;
   sandboxSettings?: SandboxSettings;
   userId?: string;
+  canonicalUserId?: string;
   scmLogin?: string;
   providerAuth?: SessionModelProviderAuthInput[];
 }) {
@@ -252,16 +219,25 @@ export async function initSession(overrides?: {
   const now = Date.now();
   await new SessionIndexStore(env.DB).create({
     id: defaults.sessionName,
+    ownerTeamId: null,
+    visibility: "workspace",
     title: defaults.title ?? null,
     repoOwner: defaults.repoOwner,
     repoName: defaults.repoName,
     model: defaults.model ?? "anthropic/claude-haiku-4-5",
     reasoningEffort: defaults.reasoningEffort ?? null,
     baseBranch: defaults.defaultBranch ?? "main",
-    repositories: defaults.repositories,
+    repositories: defaults.repositories ?? [
+      {
+        repoOwner: defaults.repoOwner,
+        repoName: defaults.repoName,
+        repoId: defaults.repoId,
+        baseBranch: defaults.defaultBranch ?? "main",
+      },
+    ],
     environmentId: defaults.environmentId ?? null,
     status: "created",
-    userId: defaults.userId,
+    userId: defaults.canonicalUserId ?? defaults.userId,
     providerAuth,
     createdAt: now,
     updatedAt: now,
@@ -343,6 +319,7 @@ export async function seedMessage(
   msg: {
     id: string;
     authorId: string;
+    admittedCanonicalUserId?: string | null;
     content: string;
     source: string;
     status: string;
@@ -352,14 +329,15 @@ export async function seedMessage(
 ): Promise<void> {
   await runInSessionDO(stub, (instance: SessionDO, state) => {
     state.storage.sql.exec(
-      "INSERT INTO messages (id, author_id, content, source, status, created_at, started_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      "INSERT INTO messages (id, author_id, content, source, status, created_at, started_at, admitted_canonical_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
       msg.id,
       msg.authorId,
       msg.content,
       msg.source,
       msg.status,
       msg.createdAt,
-      msg.startedAt ?? null
+      msg.startedAt ?? null,
+      msg.admittedCanonicalUserId ?? null
     );
   });
 }
@@ -374,9 +352,10 @@ export async function seedMessage(
 export async function initNamedSession(
   sessionName: string,
   overrides?: {
-    repoOwner?: string;
-    repoName?: string;
-    repoId?: number;
+    harness?: "opencode" | "claude" | "codex";
+    repoOwner?: string | null;
+    repoName?: string | null;
+    repoId?: number | null;
     defaultBranch?: string;
     repositories?: Array<{
       repoOwner: string;
@@ -395,7 +374,8 @@ export async function initNamedSession(
     spawnDepth?: number;
     sandboxSettings?: Record<string, unknown>;
     providerAuth?: SessionModelProviderAuthInput[];
-  }
+  },
+  beforeInit?: (stub: DurableObjectStub) => Promise<void>
 ) {
   const defaults = {
     sessionName,
@@ -406,12 +386,27 @@ export async function initNamedSession(
   const now = Date.now();
   await new SessionIndexStore(env.DB).create({
     id: sessionName,
+    harness: defaults.harness ?? "opencode",
+    ownerTeamId: null,
+    visibility: "workspace",
     title: defaults.title ?? null,
     repoOwner: defaults.repoOwner ?? null,
     repoName: defaults.repoName ?? null,
     model: defaults.model ?? "anthropic/claude-haiku-4-5",
     reasoningEffort: defaults.reasoningEffort ?? null,
     baseBranch: defaults.defaultBranch ?? "main",
+    repositories:
+      defaults.repositories ??
+      (defaults.repoOwner && defaults.repoName && defaults.repoId !== null
+        ? [
+            {
+              repoOwner: defaults.repoOwner,
+              repoName: defaults.repoName,
+              repoId: defaults.repoId,
+              baseBranch: defaults.defaultBranch ?? "main",
+            },
+          ]
+        : []),
     status: "created",
     parentSessionId: defaults.parentSessionId ?? null,
     spawnSource: defaults.spawnSource ?? "user",
@@ -422,6 +417,7 @@ export async function initNamedSession(
     updatedAt: now,
   });
 
+  await beforeInit?.(env.SESSION.get(env.SESSION.idFromName(sessionName)));
   return initNamedSessionDO(sessionName, doDefaults);
 }
 
@@ -459,6 +455,46 @@ export function collectMessages(
         resolve(messages);
       }
     });
+  });
+}
+
+/**
+ * Close a WebSocket and wait for the peer's reciprocal close.
+ *
+ * The session DO reciprocates only after its close handler has run (and
+ * logged), so awaiting this keeps that work inside the test. A fire-and-forget
+ * `close()` lets the DO log after the test file finishes, which fails the run
+ * with "Closing rpc while onUserConsoleLog was pending". Rejects if the
+ * reciprocal close does not arrive within `timeoutMs`; pass `bestEffort` from
+ * `finally` cleanup so a teardown timeout cannot mask the test's own failure.
+ *
+ * Defaults to code 1000: a bare `close()` reaches the DO as 1005, which it
+ * cannot echo back on the wire, so the reciprocal close would never arrive.
+ */
+export function closeWebSocket(
+  ws: WebSocket,
+  opts?: { code?: number; reason?: string; timeoutMs?: number; bestEffort?: boolean }
+): Promise<void> {
+  if (ws.readyState === WebSocket.CLOSED) return Promise.resolve();
+  const code = opts?.code ?? 1000;
+  if (ws.readyState === WebSocket.CLOSING) {
+    // The peer closed first and its close event fired when that close arrived, so no
+    // further event will come; reciprocating is all that is left. The DO's close
+    // handler for this socket runs after it with no client-observable completion.
+    ws.close(code, opts?.reason);
+    return Promise.resolve();
+  }
+  return new Promise((resolve, reject) => {
+    const timeoutMs = opts?.timeoutMs ?? INTEGRATION_WEBSOCKET_TIMEOUT_MS;
+    const timer = setTimeout(() => {
+      if (opts?.bestEffort) resolve();
+      else reject(new Error(`WebSocket peer did not reciprocate close within ${timeoutMs}ms`));
+    }, timeoutMs);
+    ws.addEventListener("close", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+    ws.close(code, opts?.reason);
   });
 }
 

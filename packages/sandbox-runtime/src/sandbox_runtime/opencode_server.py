@@ -14,7 +14,9 @@ import httpx
 
 from .constants import OPENCODE_PORT
 from .git_excludes import install_runtime_git_excludes
+from .managed_mcp import managed_marker
 from .mcp_packages import McpPackageInstaller
+from .memories import memory_path
 from .process_output import iter_process_lines
 from .sandbox_bin import install_bin_scripts
 
@@ -372,7 +374,16 @@ class OpenCodeServer:
                 continue
             if server.get("type") == "remote":
                 entry: dict[str, Any] = {"type": "remote", "url": server.get("url", "")}
-                auth_headers = server.get("headers") or server.get("env") or {}
+                marker = managed_marker(server)
+                auth_headers = (
+                    (server.get("headers") or {})
+                    if marker
+                    else (server.get("headers") or server.get("env") or {})
+                )
+                if marker:
+                    entry["oauth"] = False
+                    if marker["auth_mode"] == "user_oauth":
+                        entry["enabled"] = False
                 if auth_headers:
                     entry["headers"] = dict(auth_headers)
                 config[name] = entry
@@ -413,6 +424,10 @@ class OpenCodeServer:
                 }
             },
         }
+
+        memory_file = memory_path(resolve_opencode_global_config_dir())
+        if memory_file.is_file() and memory_file.stat().st_size:
+            opencode_config["instructions"] = [str(memory_file)]
 
         # Inject MCP servers
         mcp_servers = self._resolve_mcp_servers()

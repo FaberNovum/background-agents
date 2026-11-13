@@ -26,6 +26,7 @@ from .opencode_client import (
     SSEInactivityTimeoutError,
     SSEStreamDisconnectedError,
 )
+from .opencode_step_ids import StepIdTracker
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -38,6 +39,12 @@ if TYPE_CHECKING:
 # yet (their message.updated may arrive after their first parts).
 MAX_PENDING_PART_EVENTS: Final = 2000
 CONTEXT_OVERFLOW_ERROR_NAME: Final = "ContextOverflowError"
+# Providers whose models take the requested reasoning effort as an OpenCode
+# variant. OpenCode Zen and Go route each model to its own SDK, but OpenCode
+# derives the variants from the catalog either way.
+VARIANT_REASONING_PROVIDERS: Final = frozenset(
+    {"anthropic", "openai", "xai", "opencode", "opencode-go"}
+)
 
 OPENCODE_DEFAULT_TITLE_RE: Final = re.compile(
     r"^(new session|child session) - " r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$",
@@ -72,6 +79,7 @@ class _PromptState:
     # Priced step costs keyed by OpenCode part id. Last write wins, so a part
     # OpenCode re-emits with a corrected cost replaces its earlier value.
     step_costs: dict[str, float] = field(default_factory=dict)
+    step_ids: StepIdTracker = field(default_factory=StepIdTracker)
     # Set when a parent context-overflow announcement was swallowed; cleared by
     # session.compacted. If still set at idle with no error emitted, the
     # promised compaction never happened and the prompt must fail.
@@ -633,6 +641,7 @@ class OpenCodePromptStream:
                         "type": "token",
                         "content": state.cumulative_text[part_id],
                         "messageId": state.message_id,
+                        **({"partId": part_id} if isinstance(part_id, str) and part_id else {}),
                     }
                 )
 
@@ -655,24 +664,36 @@ class OpenCodePromptStream:
                     events.append(tool_event)
 
         elif part_type == "step-start":
+            message_id = part.get("messageID") or part.get("sessionID") or ""
+            step_id = state.step_ids.start(
+                message_id, part_id if isinstance(part_id, str) else None
+            )
             events.append(
                 {
                     "type": "step_start",
                     "messageId": state.message_id,
+                    "stepId": step_id,
                 }
             )
 
         elif part_type == "step-finish":
+            message_id = part.get("messageID") or part.get("sessionID") or ""
+            step_id = state.step_ids.finish(
+                message_id, part_id if isinstance(part_id, str) else None
+            )
             cost = part.get("cost")
             if isinstance(cost, int | float) and not isinstance(cost, bool):
                 state.step_costs[str(part.get("id", ""))] = float(cost)
             finish_event = {
                 "type": "step_finish",
-                "tokens": part.get("tokens"),
-                "reason": part.get("reason"),
                 "messageId": state.message_id,
+                "stepId": step_id,
                 "messageCostUsd": state.message_cost_usd(),
             }
+            if part.get("tokens") is not None:
+                finish_event["tokens"] = part["tokens"]
+            if part.get("reason") is not None:
+                finish_event["reason"] = part["reason"]
             if cost is not None:
                 finish_event["cost"] = cost
             events.append(finish_event)
@@ -853,7 +874,7 @@ class OpenCodePromptStream:
                 "modelID": model_id,
             }
 
-            if reasoning_effort and provider_id in {"anthropic", "openai", "xai"}:
+            if reasoning_effort and provider_id in VARIANT_REASONING_PROVIDERS:
                 request_body["variant"] = reasoning_effort
 
             request_body["model"] = model_spec
@@ -969,12 +990,8 @@ class OpenCodePromptStream:
                                 prev_len=len(previously_sent),
                                 new_len=len(text),
                             )
-                            state.cumulative_text[part_id] = text
-                            yield {
-                                "type": "token",
-                                "content": text,
-                                "messageId": state.message_id,
-                            }
+                            for event in self._handle_part(state, part, None):
+                                yield event
 
         except Exception as e:
             self._log.error("bridge.final_state_error", exc=e)
