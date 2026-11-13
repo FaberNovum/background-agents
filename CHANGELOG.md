@@ -4,12 +4,12 @@ New features, integrations, and notable improvements to Open-Inspect — newest 
 
 ## November 13, 2026
 
-**Fork sync: personal access tokens and external MCP.** The TruePulseLabs deployment sources
-include upstream through `531aedff`, including token issuance, workspace token policy, and the
-external MCP server. Deploy the pending D1 migrations and both the control plane and web app before
-issuing a token under **Settings › Access tokens**. The fork retains signed Marker follow-up
-webhooks, provider-account reconnection, and pstack child-session workflows. The shared native
-harness tool registry provides `wait-for-children` to both Claude and Codex.
+**Fork sync: personal access tokens and external MCP.** The TruePulseLabs deployment sources include
+upstream through `531aedff`, including token issuance, workspace token policy, and the external MCP
+server. Deploy the pending D1 migrations and both the control plane and web app before issuing a
+token under **Settings › Access tokens**. The fork retains signed Marker follow-up webhooks,
+provider-account reconnection, and pstack child-session workflows. The shared native harness tool
+registry provides `wait-for-children` to both Claude and Codex.
 
 ## November 10, 2026
 

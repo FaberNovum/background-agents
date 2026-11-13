@@ -661,5 +661,3 @@ async def test_wait_for_children_returns_every_terminal_response(
     assert [request.url.path for request in seen].count("/sessions/s1/children") == 2
     detail_requests = [request for request in seen if request.url.path != "/sessions/s1/children"]
     assert all(request.url.params["include"] == "result" for request in detail_requests)
-
-

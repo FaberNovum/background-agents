@@ -380,8 +380,7 @@ class OpenInspectTools:
                 return error_result(f"Failed to wait for child sessions: {error}")
             if response.status_code >= 400:
                 return error_result(
-                    f"Failed to list children: {error_text(response)} "
-                    f"(HTTP {response.status_code})"
+                    f"Failed to list children: {error_text(response)} (HTTP {response.status_code})"
                 )
 
             body = response.json()
