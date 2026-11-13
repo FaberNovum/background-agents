@@ -26,12 +26,15 @@ function setup(protectedPaths: Record<string, number | undefined>) {
   } as unknown as McpConnectionStore;
   const fetcher = async (request: Request) => {
     const url = new URL(request.url);
-    requested.push(url.pathname);
+    requested.push(`${url.pathname}${url.search}`);
     if (url.pathname.startsWith(ROOT_PATH)) {
       const status = protectedPaths[url.pathname];
       if (status === undefined) return new Response("not found", { status: 404 });
       if (status !== 200) return new Response("error", { status });
-      return Response.json({ resource: RESOURCE, authorization_servers: [ORIGIN] });
+      return Response.json({
+        resource: `${RESOURCE}${url.search}`,
+        authorization_servers: [ORIGIN],
+      });
     }
     if (url.pathname === "/.well-known/oauth-authorization-server") {
       return Response.json({
@@ -66,6 +69,20 @@ describe("McpOAuthService protected resource discovery", () => {
     const { service, requested } = setup({ [ROOT_PATH]: 200 });
     await expect(service.client(server, REDIRECT)).resolves.toMatchObject({ client_id: "client" });
     expect(requested.slice(0, 2)).toEqual([`${ROOT_PATH}/v4/mcp`, ROOT_PATH]);
+  });
+
+  it("keeps the resource query on both probes", async () => {
+    const { service, requested } = setup({ [ROOT_PATH]: 200 });
+    const scoped = {
+      ...server,
+      url: `${RESOURCE}?connection=abc`,
+      oauth: { issuer: ORIGIN, resource: `${RESOURCE}?connection=abc` },
+    } as unknown as McpServerMetadata;
+    await expect(service.client(scoped, REDIRECT)).resolves.toMatchObject({ client_id: "client" });
+    expect(requested.slice(0, 2)).toEqual([
+      `${ROOT_PATH}/v4/mcp?connection=abc`,
+      `${ROOT_PATH}?connection=abc`,
+    ]);
   });
 
   it("fails when neither location publishes metadata", async () => {

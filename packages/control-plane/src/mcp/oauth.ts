@@ -76,12 +76,16 @@ async function oauthRequest(
 }
 /**
  * RFC 9728 discovery by probing: the path-inserted well-known URL first, then the origin-root URL
- * for servers that only publish metadata there. A probe that returns a non-success response falls
- * through to the next candidate; timeouts, oversized bodies and other failures do not.
+ * for servers that only publish metadata there. Preserve queries that identify scoped resources.
+ * A probe that returns a non-success response falls through to the next candidate; timeouts,
+ * oversized bodies and other failures do not.
  */
 async function protectedResourceMetadata(fetcher: McpFetch, resource: URL): Promise<unknown> {
   const base = `${resource.origin}/.well-known/oauth-protected-resource`;
-  const candidates = resource.pathname === "/" ? [base] : [`${base}${resource.pathname}`, base];
+  const candidates =
+    resource.pathname === "/"
+      ? [`${base}${resource.search}`]
+      : [`${base}${resource.pathname}${resource.search}`, `${base}${resource.search}`];
   for (const [index, url] of candidates.entries()) {
     try {
       return await oauthRequest(fetcher, url);
