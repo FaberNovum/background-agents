@@ -39,7 +39,7 @@ export type ModelProviderAccountServiceAccountStore = Pick<
 
 export type ModelProviderAccountServiceCredentialStore = Pick<
   ProviderCredentialStore,
-  "tryBeginExchange" | "clearSafeFailure"
+  "tryBeginExchange" | "clearSafeFailure" | "readCredentialVersion"
 > & {
   readCredentialState(
     providerAccountId: string,
@@ -325,14 +325,20 @@ export class ModelProviderAccountService {
     actorId: string,
     now: number
   ): Promise<ModelProviderAccount> {
-    const current = await this.credentials.readCredentialState(account.id, account.provider);
-    if (!current) throw this.consumedCredentialError();
+    // The version alone fences the replacement. Decrypting the credential being
+    // replaced would make an account unreadable under the current encryption key
+    // impossible to reconnect.
+    const currentCredentialVersion = await this.credentials.readCredentialVersion(
+      account.id,
+      account.provider
+    );
+    if (currentCredentialVersion === null) throw this.consumedCredentialError();
     try {
       const replaced = await this.atomicWriter.reconnectCredentialAndAccount({
         providerAccountId: account.id,
         provider: account.provider,
         credentialSchemaVersion: adapter.credentialSchemaVersion,
-        expectedCredentialVersion: current.credentialVersion,
+        expectedCredentialVersion: currentCredentialVersion,
         payload: connected.credential,
         accessTokenExpiresAt: connected.accessTokenExpiresAt,
         externalAccountId: connected.externalAccountId ?? account.externalAccountId,

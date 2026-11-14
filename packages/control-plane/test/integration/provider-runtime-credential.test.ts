@@ -8,8 +8,13 @@ import { initNamedSession, routeRequest, seedSandboxAuth } from "./helpers";
 const ANTHROPIC_ACCOUNT_ID = "a".repeat(32);
 const OPENAI_ACCOUNT_ID = "b".repeat(32);
 const YEAR_MS = 365 * 24 * 60 * 60 * 1000;
+const OBSOLETE_ENCRYPTION_KEY = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 
-async function seedAnthropicAccount(now: number, expiresAt = now + YEAR_MS) {
+async function seedAnthropicAccount(
+  now: number,
+  expiresAt = now + YEAR_MS,
+  encryptionKey = env.PROVIDER_ACCOUNTS_ENCRYPTION_KEY!
+) {
   await env.DB.prepare(
     `INSERT INTO model_provider_accounts
       (id, provider, display_name, external_account_id, status, created_at, updated_at)
@@ -17,7 +22,7 @@ async function seedAnthropicAccount(now: number, expiresAt = now + YEAR_MS) {
   )
     .bind(ANTHROPIC_ACCOUNT_ID, now, now)
     .run();
-  await new ProviderCredentialStore(env.DB, env.PROVIDER_ACCOUNTS_ENCRYPTION_KEY!).create({
+  await new ProviderCredentialStore(env.DB, encryptionKey).create({
     providerAccountId: ANTHROPIC_ACCOUNT_ID,
     provider: "anthropic",
     credentialSchemaVersion: 1,
@@ -93,6 +98,23 @@ describe("stored provider secret delivery", () => {
       secret: "sk-ant-oat01-integration-secret",
       credentialVersion: 1,
       expiresAt: expect.any(Number),
+    });
+  });
+
+  it("denies a credential encrypted with an obsolete key instead of failing", async () => {
+    const now = Date.now();
+    await seedAnthropicAccount(now, now + YEAR_MS, OBSOLETE_ENCRYPTION_KEY);
+    const sessionName = `issuance-obsolete-key-${now}`;
+    const { stub } = await initNamedSession(sessionName, { providerAuth: anthropicSessionAuth() });
+    await seedSandboxAuth(stub, { authToken: "sandbox-token", sandboxId: "sandbox-1" });
+
+    const response = await fetchRuntimeCredential(sessionName, "sandbox-token", "sandbox-1");
+
+    // A 409 without the retryable flag is a denial: the sandbox reports it once
+    // instead of spending its restart budget on a credential that cannot be read.
+    expect(response.status).toBe(409);
+    await expect(response.json()).resolves.toEqual({
+      error: "Provider credential is unreadable; reconnect the account",
     });
   });
 

@@ -216,6 +216,47 @@ describe("provider account management routes", () => {
     }
   });
 
+  it("reconnects an account whose credential was encrypted with an obsolete key", async () => {
+    const now = Date.now();
+    await env.DB.prepare(
+      `INSERT INTO model_provider_accounts
+        (id, provider, display_name, external_account_id, status, created_at, updated_at)
+        VALUES (?, 'openai', 'Team ChatGPT', 'acct-integration', 'active', ?, ?)`
+    )
+      .bind(OPENAI_ACCOUNT_ID, now, now)
+      .run();
+    await new ProviderCredentialStore(
+      env.DB,
+      "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+    ).create({
+      providerAccountId: OPENAI_ACCOUNT_ID,
+      provider: "openai",
+      credentialSchemaVersion: 1,
+      payload: { refreshToken: "obsolete-key-refresh", accountId: "acct-integration" },
+      accessTokenExpiresAt: null,
+      now,
+    });
+
+    const reconnected = await managementFetch(
+      `/model-provider-accounts/${OPENAI_ACCOUNT_ID}/reconnect`,
+      {
+        method: "POST",
+        body: {
+          provider: "openai",
+          refreshToken: "integration-openai-refresh-reconnect",
+          accountId: "acct-integration",
+        },
+      }
+    );
+
+    expect(reconnected.status).toBe(200);
+    const state = await new ProviderCredentialStore(
+      env.DB,
+      env.PROVIDER_ACCOUNTS_ENCRYPTION_KEY!
+    ).readCredentialState(OPENAI_ACCOUNT_ID, "openai");
+    expect(state?.credentialVersion).toBe(2);
+  });
+
   it("preflights a duplicate identity through an atomic reconnect", async () => {
     const first = await managementFetch("/model-provider-accounts", {
       method: "POST",
