@@ -109,6 +109,7 @@ function stores(account: ModelProviderAccount | null = providerAccount()): {
     credentials: {
       tryBeginExchange: vi.fn(async () => ({ acquired: true as const, generation: 1 })),
       clearSafeFailure: vi.fn(async () => true),
+      readCredentialVersion: vi.fn(async (): Promise<number | null> => 1),
       readCredentialState: vi.fn(async () => ({
         payload: { refreshToken: "stored-secret" },
         credentialSchemaVersion: 1,

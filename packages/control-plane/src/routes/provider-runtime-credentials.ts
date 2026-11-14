@@ -104,18 +104,31 @@ async function handleRuntimeCredential(
   }
 
   const credentials = new ProviderCredentialStore(ctx.db, env.PROVIDER_ACCOUNTS_ENCRYPTION_KEY);
-  const state = await credentials.readCredentialState(account.id, provider);
-  if (!state) return error("Provider credential not found", 409);
+  // A payload that cannot be decrypted (the encryption key changed since the
+  // account was connected) or parsed is a denial: retrying never recovers it,
+  // and only a reconnect replaces it.
+  let state;
   let credential: StoredCredential | null;
   try {
+    state = await credentials.readCredentialState(account.id, provider);
+    if (!state) return error("Provider credential not found", 409);
     const parsed = registry
       .require(provider)
       .parseCredential(state.payload, state.credentialSchemaVersion);
     credential = parseStoredCredentialPayload(parsed);
-  } catch {
+  } catch (cause) {
+    logger.warn("provider_credential.unreadable", {
+      event: "provider_credential.unreadable",
+      provider,
+      provider_account_id: account.id,
+      session_id: sessionId,
+      error: cause instanceof Error ? cause : String(cause),
+    });
     credential = null;
   }
-  if (!credential) return error("Provider credential is unreadable", 409);
+  if (!state || !credential) {
+    return error("Provider credential is unreadable; reconnect the account", 409);
+  }
 
   const now = Date.now();
   if (credential.expiresAt - now <= EXPIRY_GUARD_MS) {
